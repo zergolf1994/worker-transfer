@@ -17,6 +17,7 @@ UNINSTALL=false
 DATABASE_URL=""
 STORAGE_ID=""
 STORAGE_PATH="/home/files"
+REDIS_URL=""
 
 APP_NAME="worker-transfer"
 APP_DIR="/opt/$APP_NAME"
@@ -35,6 +36,7 @@ while [[ $# -gt 0 ]]; do
         --count|-w|-n)       WORKER_COUNT="$2"; shift 2 ;;
         --database-url)      DATABASE_URL="$2"; shift 2 ;;
         --mongodb-uri)       DATABASE_URL="$2"; shift 2 ;; # alias เดิม
+        --redis-url)         REDIS_URL="$2"; shift 2 ;;
         --storage-id)        STORAGE_ID="$2"; shift 2 ;;
         --storage-path)      STORAGE_PATH="$2"; shift 2 ;;
         -h|--help)
@@ -49,6 +51,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --database-url URI   MongoDB connection string (DATABASE_URL)"
             echo "  --storage-id ID      Local storage ID (REQUIRED — storage ที่เครื่องนี้ดูแล)"
             echo "  --storage-path DIR   Local storage path (default: /home/files)"
+            echo "  --redis-url URL      Redis URL (optional — ลบแคช content/player หลังติดตั้ง media)"
             echo "  -h, --help           Show this help"
             echo ""
             echo "Examples:"
@@ -151,6 +154,7 @@ cat > "$APP_DIR/.env" <<EOF
 DATABASE_URL=$DATABASE_URL
 STORAGE_ID=$STORAGE_ID
 STORAGE_PATH=$STORAGE_PATH
+REDIS_URL=$REDIS_URL
 EOF
 
 # ─── Systemd service template ─────────────────────────────────

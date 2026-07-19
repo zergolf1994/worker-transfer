@@ -8,6 +8,7 @@ import (
 	"syscall"
 	"time"
 
+	"worker-transfer/internal/cache"
 	"worker-transfer/internal/config"
 	"worker-transfer/internal/core/logger"
 	"worker-transfer/internal/core/utils"
@@ -40,6 +41,9 @@ func main() {
 		defer logCloser.Close()
 		log.Printf("📝 Logging to: %s", config.AppConfig.LogPath)
 	}
+
+	// ── Redis (optional — ลบแคช content/player หลังติดตั้ง media) ──
+	cache.Init(config.AppConfig.RedisURL)
 
 	// ── MongoDB ───────────────────────────────────────────────
 	if err := database.Connect(); err != nil {

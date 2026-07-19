@@ -203,7 +203,118 @@ func resolveS3TempStorage(ctx context.Context) (*models.Storage, error) {
 	return storage, nil
 }
 
+// ─── Cache invalidation (Redis + Cloudflare) ─────────────────
+
+// collectSlugs คืน slug ของไฟล์ + cloned files ทั้งหมด (ใช้ทั้ง Redis DEL
+// และ CF purge — query ครั้งเดียว)
+func collectSlugs(ctx context.Context, fileID, slug string) []string {
+	slugs := []string{}
+	if slug != "" {
+		slugs = append(slugs, slug)
+	}
+	cursor, err := models.FileModel.FindRaw(ctx, bson.M{
+		"clonedFrom":         fileID,
+		"type":               enums.FileTypeVideo,
+		"metadata.trashedAt": bson.M{"$exists": false},
+		"metadata.deletedAt": bson.M{"$exists": false},
+	}, options.Find().SetProjection(bson.M{"slug": 1}))
+	if err != nil {
+		return slugs
+	}
+	defer cursor.Close(ctx)
+	for cursor.Next(ctx) {
+		var clonedFile models.File
+		if err := cursor.Decode(&clonedFile); err != nil {
+			continue
+		}
+		if clonedFile.Slug != "" {
+			slugs = append(slugs, clonedFile.Slug)
+		}
+	}
+	return slugs
+}
+
+// redisKeysFor คืน key แคชฝั่ง content-node/player-node ของแต่ละ slug
+// (playlist_master = response cache ของ playlist.m3u8, playlist_json =
+// JW feed, embed_resolve = lookup ของหน้า embed)
+func redisKeysFor(slugs []string) []string {
+	keys := make([]string, 0, len(slugs)*3)
+	for _, s := range slugs {
+		keys = append(keys,
+			"playlist_master:"+s,
+			"playlist_json:"+s,
+			"embed_resolve:"+s,
+		)
+	}
+	return keys
+}
+
 // ─── Cloudflare playlist purge ───────────────────────────────
+
+// resolveCfProfile หา CF zone/token ของ purpose ที่กำหนด (เช่น "playlist")
+// จาก domain_bindings.{purpose} → profile id → หาใน domain_profiles ด้วย _id
+//
+// เข้มงวดตามที่ตั้งเท่านั้น: ไม่ได้ผูก binding (null) หรือ profile หาย
+// → คืนค่าว่าง = ไม่ล้างแคช (ไม่มีการเดา profile แรก / key เก่า)
+func resolveCfProfile(ctx context.Context, purpose string) utils.CloudflareConfig {
+	var empty utils.CloudflareConfig
+
+	binding, err := models.SettingModel.FindOne(ctx, bson.M{"name": enums.SettingDomainBindings})
+	if err != nil {
+		return empty
+	}
+	m, ok := asBsonM(binding.Value)
+	if !ok {
+		return empty
+	}
+	profileID, _ := m[purpose].(string)
+	if profileID == "" {
+		return empty // ไม่ได้ตั้ง → ไม่ต้องล้างแคช
+	}
+
+	setting, err := models.SettingModel.FindOne(ctx, bson.M{"name": enums.SettingDomainProfiles})
+	if err != nil {
+		return empty
+	}
+	profiles, ok := setting.Value.(bson.A)
+	if !ok {
+		return empty
+	}
+	for _, p := range profiles {
+		pm, ok := asBsonM(p)
+		if !ok {
+			continue
+		}
+		if id, _ := pm["_id"].(string); id != profileID {
+			continue
+		}
+		zone, _ := pm["zone_id"].(string)
+		token, _ := pm["api_token"].(string)
+		if zone == "" || token == "" {
+			return empty
+		}
+		return utils.CloudflareConfig{ZoneID: zone, APIToken: token}
+	}
+	return empty
+}
+
+func asBsonM(v interface{}) (bson.M, bool) {
+	switch m := v.(type) {
+	case bson.M:
+		return m, true
+	case map[string]interface{}:
+		return bson.M(m), true
+	case bson.D:
+		// default registry decode document ใน interface{} เป็น bson.D
+		out := bson.M{}
+		for _, e := range m {
+			out[e.Key] = e.Value
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
 
 func isPurgeResolution(res string) bool {
 	switch res {
@@ -214,8 +325,9 @@ func isPurgeResolution(res string) bool {
 	}
 }
 
-// purgePlaylistCache purges playlist.m3u8 from Cloudflare for the file and its clones.
-func purgePlaylistCache(ctx context.Context, slug, fileID string) {
+// purgePlaylistCache purges playlist.m3u8 from Cloudflare for all slugs.
+// ไม่ได้ผูก CF profile (domain_bindings.playlist) → ข้ามเงียบๆ
+func purgePlaylistCache(ctx context.Context, slug string, slugs []string) {
 	domainSetting, err := models.SettingModel.FindOne(ctx, bson.M{"name": enums.SettingDomainPlaylist})
 	if err != nil {
 		return
@@ -229,42 +341,18 @@ func purgePlaylistCache(ctx context.Context, slug, fileID string) {
 	}
 	domain = strings.TrimRight(domain, "/")
 
-	zoneSetting, err := models.SettingModel.FindOne(ctx, bson.M{"name": enums.SettingCfZoneID})
-	if err != nil {
-		return
-	}
-	tokenSetting, err := models.SettingModel.FindOne(ctx, bson.M{"name": enums.SettingCfApiToken})
-	if err != nil {
-		return
-	}
-
-	cfConfig := utils.CloudflareConfig{
-		ZoneID:   zoneSetting.GetString(""),
-		APIToken: tokenSetting.GetString(""),
-	}
+	cfConfig := resolveCfProfile(ctx, "playlist")
 	if cfConfig.ZoneID == "" || cfConfig.APIToken == "" {
+		// ไม่ได้ผูก CF profile — ข้ามเงียบๆ (ตั้งใจ ไม่ใช่ error)
 		return
 	}
 
-	purgeURLs := []string{fmt.Sprintf("%s/%s/playlist.m3u8", domain, slug)}
-
-	cursor, err := models.FileModel.FindRaw(ctx, bson.M{
-		"clonedFrom":         fileID,
-		"type":               enums.FileTypeVideo,
-		"metadata.trashedAt": bson.M{"$exists": false},
-		"metadata.deletedAt": bson.M{"$exists": false},
-	}, options.Find().SetProjection(bson.M{"slug": 1}))
-	if err == nil {
-		defer cursor.Close(ctx)
-		for cursor.Next(ctx) {
-			var clonedFile models.File
-			if err := cursor.Decode(&clonedFile); err != nil {
-				continue
-			}
-			if clonedFile.Slug != "" {
-				purgeURLs = append(purgeURLs, fmt.Sprintf("%s/%s/playlist.m3u8", domain, clonedFile.Slug))
-			}
-		}
+	purgeURLs := make([]string, 0, len(slugs))
+	for _, s := range slugs {
+		purgeURLs = append(purgeURLs, fmt.Sprintf("%s/%s/playlist.m3u8", domain, s))
+	}
+	if len(purgeURLs) == 0 {
+		return
 	}
 
 	log.Printf("☁️  [%s] Purging %d playlist URL(s) from Cloudflare cache...", slug, len(purgeURLs))
@@ -272,3 +360,4 @@ func purgePlaylistCache(ctx context.Context, slug, fileID string) {
 		log.Printf("⚠️  [%s] Cloudflare purge failed: %v", slug, err)
 	}
 }
+

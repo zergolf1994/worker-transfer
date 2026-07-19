@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"worker-transfer/internal/cache"
 	"worker-transfer/internal/config"
 	"worker-transfer/internal/core/enums"
 	"worker-transfer/internal/core/utils"
@@ -214,6 +215,7 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 	startStep(ctx, job.ID, "media")
 	now := time.Now()
 	mimeType := "video/mp4"
+	needCfPurge := false // resolution ใหม่ลง → playlist.m3u8 เปลี่ยน
 
 	for _, res := range installedRes {
 		if hasVideoMedia(ctx, fileID, res) {
@@ -239,7 +241,7 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 		cloneMediaToClonedFiles(ctx, fileID, media, slug)
 		utils.LogMain("✅ [%s] Media record: %s", slug, res)
 		if isPurgeResolution(res) {
-			purgePlaylistCache(ctx, slug, fileID)
+			needCfPurge = true
 		}
 	}
 
@@ -277,6 +279,19 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 		softDeleteIngest(ctx, a.ingest.ID, slug, a.fileName)
 	}
 	completeStep(ctx, job.ID, "media")
+
+	// ─── Cache invalidation (ครั้งเดียวต่อ job — ไฟล์ + clones) ──
+	// Redis: ลบ playlist_master/playlist_json/embed_resolve ทุกครั้งที่มี
+	//   media ใหม่ (รวม sprite — embed/feed เปลี่ยน) | ไม่ตั้ง REDIS_URL = no-op
+	// Cloudflare: purge playlist.m3u8 เฉพาะตอน resolution ใหม่ลง —
+	//   ไม่ได้ผูก domain_bindings.playlist = ข้าม
+	if len(installedRes) > 0 || hasSpriteZip {
+		slugs := collectSlugs(ctx, fileID, slug)
+		cache.Del(ctx, redisKeysFor(slugs)...)
+		if needCfPurge {
+			purgePlaylistCache(ctx, slug, slugs)
+		}
+	}
 
 	// original playable from local storage → file is fully ready
 	if hasVideoMedia(ctx, fileID, enums.ResolutionOriginal) && file.Status != enums.FileStatusReady {

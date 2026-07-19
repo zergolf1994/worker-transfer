@@ -17,6 +17,10 @@ type Config struct {
 	StorageId   string
 	StoragePath string
 
+	// Redis (optional) — ใช้ลบแคช content-node/player-node หลังติดตั้ง media
+	// ไม่ตั้ง = ไม่ใช้ (env: REDIS_URL, รองรับ RADIS_URL)
+	RedisURL string
+
 	LogPath string // Path to rotating log file (env: LOG_PATH)
 }
 
@@ -29,6 +33,7 @@ func Load() {
 		MongoURI:    getEnv("DATABASE_URL", "mongodb://localhost:27017"),
 		StorageId:   getEnv("STORAGE_ID", ""),
 		StoragePath: getEnv("STORAGE_PATH", "./files"),
+		RedisURL:    getEnv("REDIS_URL", getEnv("RADIS_URL", "")),
 		LogPath:     getEnv("LOG_PATH", "logs/worker-transfer.log"),
 	}
 }
