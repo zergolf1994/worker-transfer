@@ -29,8 +29,10 @@ type JobHandler func(ctx context.Context, job *models.VideoProcess) error
 
 const (
 	claimInterval = 10 * time.Second // idle poll — queue empty / disabled / disk full
-	// same threshold as heartbeat: stop claiming before the disk actually fills
-	diskClaimThreshold = 90.0
+	// same emergency threshold as heartbeat (98%) — real-time guard กัน race:
+	// enqueuer อาจแจกงานจาก DB % ที่ยัง lag ก่อน disk เต็ม → เช็ค disk จริงก่อน claim
+	// (cutoff จริง 95% อยู่ที่ service — อันนี้ safety สูงกว่า)
+	diskClaimThreshold = 98.0
 )
 
 // ClaimGate — optional pre-claim check set by main. A non-empty reason

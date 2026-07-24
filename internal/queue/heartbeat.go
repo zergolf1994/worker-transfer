@@ -26,9 +26,11 @@ import (
 
 const (
 	heartbeatInterval = 1 * time.Minute
-	// disk >= 90% → paused + enable=false: keeps beating (visible in admin)
-	// but the enqueuer stops counting it as capacity
-	diskPauseThreshold = 90.0
+	// disk >= 98% → paused + enable=false: keeps beating (visible in admin)
+	// but the enqueuer stops counting it as capacity.
+	// เพดานฉุกเฉิน (safety) — cutoff จริงอยู่ที่ service transfer_config.maxPercent (95)
+	// ตั้งสูงกว่า cutoff เพื่อกัน race ตอน DB % ยัง lag (disk เต็มก่อน heartbeat รายงาน)
+	diskPauseThreshold = 98.0
 )
 
 // StartHeartbeat sends heartbeats until ctx is cancelled, then marks the
