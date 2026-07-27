@@ -31,7 +31,11 @@ func derefStr(s *string) string {
 // enqueuer decides WHICH storage a file belongs on (targetStorageId on
 // the job) — this worker only checks that its own storage is usable.
 
-const storageCapacityMaxPercent = 90.0
+// 98% ให้ตรงกับ diskPauseThreshold/diskClaimThreshold — นี่คือ emergency
+// guard ตัวสุดท้าย ไม่ใช่ cutoff ตัดสินใจ (cutoff จริง 95% อยู่ที่ enqueuer
+// ผ่าน transfer_config.maxPercent) ของเดิม 90 ทำให้ worker เข้มกว่าคนแจกงาน
+// จน storage ที่ enqueuer ยังจ่ายงานให้อยู่กลับไม่มีใครหยิบ
+const storageCapacityMaxPercent = 98.0
 
 // localStorageBlockReason returns why this worker's STORAGE_ID cannot
 // accept jobs right now (empty = ok).
