@@ -10,7 +10,6 @@ import (
 
 	"worker-transfer/internal/cache"
 	"worker-transfer/internal/config"
-	"worker-transfer/internal/core/logger"
 	"worker-transfer/internal/core/utils"
 	"worker-transfer/internal/db/database"
 	"worker-transfer/internal/queue"
@@ -33,14 +32,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ── Rotating file logger ──────────────────────────────────
-	logCloser, err := logger.Init(config.AppConfig.LogPath)
-	if err != nil {
-		log.Printf("⚠️ File logging disabled: %v", err)
-	} else {
-		defer logCloser.Close()
-		log.Printf("📝 Logging to: %s", config.AppConfig.LogPath)
-	}
+	// log ทั่วไปออก stdout ให้ systemd/journald เก็บและหมุนให้
+	// (journalctl -u worker-transfer -f) — ของเดิมเรียก logger.Init ซึ่ง
+	// log.SetOutput ทับ stdout ทำให้ journal ว่างเปล่า และไฟล์ที่หมุนไว้
+	// ก็ไม่มีใครลบ ส่วน log รายงาน (logs/process/{slug}.log) ยังเขียนอยู่
+	// เพราะต้องอัพขึ้น S3 ตอนงานจบ
 
 	// ── Redis (optional — ลบแคช content/player หลังติดตั้ง media) ──
 	cache.Init(config.AppConfig.RedisURL)
