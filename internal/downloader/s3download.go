@@ -138,12 +138,15 @@ func DownloadFromS3(ctx context.Context, storage *models.Storage, objectPath, ou
 }
 
 // DeleteFromS3 deletes a file from S3-compatible storage
-func DeleteFromS3(storage *models.Storage, objectPath string) error {
+func DeleteFromS3(ctx context.Context, storage *models.Storage, objectPath string) error {
 	if storage.S3 == nil {
 		return fmt.Errorf("storage has no S3 config")
 	}
 
 	s3Cfg := storage.S3
+	if s3Cfg.Endpoint == nil || strings.TrimSpace(*s3Cfg.Endpoint) == "" {
+		return fmt.Errorf("storage has no S3 endpoint")
+	}
 	endpoint := strings.TrimRight(*s3Cfg.Endpoint, "/")
 	if !strings.HasPrefix(endpoint, "http") {
 		endpoint = "https://" + endpoint
@@ -174,7 +177,7 @@ func DeleteFromS3(storage *models.Storage, objectPath string) error {
 		UsePathStyle: s3Cfg.ForcePathStyle,
 	})
 
-	_, err := client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
+	_, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s3Cfg.Bucket),
 		Key:    aws.String(objectKey),
 	})

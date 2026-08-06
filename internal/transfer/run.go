@@ -344,8 +344,8 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 	if len(installedRes) > 0 || hasSpriteZip {
 		slugs := collectSlugs(ctx, fileID, slug)
 		cache.Del(ctx, redisKeysFor(slugs)...)
-		if needCfPurge {
-			purgePlaylistCache(ctx, slug, slugs, isMigration)
+		if needCfPurge && !isMigration {
+			_ = purgePlaylistCache(ctx, slug, slugs, false)
 		}
 	}
 

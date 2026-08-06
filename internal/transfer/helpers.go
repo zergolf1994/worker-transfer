@@ -444,16 +444,16 @@ func purgePlaylistCache(
 	slug string,
 	slugs []string,
 	includeVideoPlaylist bool,
-) {
+) error {
 	domainSetting, err := models.SettingModel.FindOne(ctx, bson.M{"name": enums.SettingDomainPlaylist})
 	if err != nil {
 		log.Printf("⚠️  [%s] Cloudflare purge skipped: domain_playlist is unavailable", slug)
-		return
+		return nil
 	}
 	domain := domainSetting.GetString("")
 	if domain == "" {
 		log.Printf("⚠️  [%s] Cloudflare purge skipped: domain_playlist is empty", slug)
-		return
+		return nil
 	}
 	if !strings.HasPrefix(domain, "http://") && !strings.HasPrefix(domain, "https://") {
 		domain = "https://" + domain
@@ -464,7 +464,7 @@ func purgePlaylistCache(
 	if cfConfig.ZoneID == "" || cfConfig.APIToken == "" {
 		log.Printf("⚠️  [%s] Cloudflare purge skipped: playlist profile is not configured", slug)
 		// ไม่ได้ผูก CF profile — ข้ามเงียบๆ (ตั้งใจ ไม่ใช่ error)
-		return
+		return nil
 	}
 
 	urlsPerSlug := 1
@@ -479,11 +479,13 @@ func purgePlaylistCache(
 		}
 	}
 	if len(purgeURLs) == 0 {
-		return
+		return nil
 	}
 
 	log.Printf("☁️  [%s] Purging %d playlist URL(s) from Cloudflare cache...", slug, len(purgeURLs))
 	if err := utils.PurgeCloudflareCache(ctx, cfConfig, purgeURLs); err != nil {
 		log.Printf("⚠️  [%s] Cloudflare purge failed: %v", slug, err)
+		return err
 	}
+	return nil
 }

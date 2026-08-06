@@ -7,10 +7,12 @@ import (
 	"path/filepath"
 	"time"
 
+	"worker-transfer/internal/cache"
 	"worker-transfer/internal/config"
 	"worker-transfer/internal/core/enums"
 	"worker-transfer/internal/core/utils"
 	"worker-transfer/internal/db/models"
+	"worker-transfer/internal/downloader"
 	"worker-transfer/internal/queue"
 	"worker-transfer/internal/uploader"
 
@@ -186,6 +188,50 @@ func runCleanup(ctx context.Context, job *models.VideoProcess) error {
 	completeStep(ctx, job.ID, "verify")
 
 	startStep(ctx, job.ID, "cleanup")
+	ingestCursor, err := models.IngestModel.FindRaw(ctx, bson.M{
+		"migrationId":     migrationID,
+		"sourceStorageId": sourceStorageID,
+		"sourceType":      enums.IngestSourceTypeMigration,
+		"migrationState":  enums.IngestMigrationStateInstalled,
+		"deletedAt":       bson.M{"$exists": false},
+	})
+	if err != nil {
+		return fmt.Errorf("load installed migration ingests: %w", err)
+	}
+	defer ingestCursor.Close(ctx)
+
+	installedIngests := make([]models.Ingest, 0, len(job.SourceMediaIDs))
+	for ingestCursor.Next(ctx) {
+		var ingest models.Ingest
+		if err := ingestCursor.Decode(&ingest); err != nil {
+			return fmt.Errorf("decode installed migration ingest: %w", err)
+		}
+		installedIngests = append(installedIngests, ingest)
+	}
+	if err := ingestCursor.Err(); err != nil {
+		return fmt.Errorf("scan installed migration ingests: %w", err)
+	}
+
+	tempStorages := map[string]*models.Storage{}
+	for _, ingest := range installedIngests {
+		tempStorageID := derefStr(ingest.StorageID)
+		objectKey := derefStr(ingest.Path)
+		if tempStorageID == "" || objectKey == "" {
+			return fmt.Errorf("migration ingest %s has no temp storage or object path", ingest.ID)
+		}
+		tempStorage, ok := tempStorages[tempStorageID]
+		if !ok {
+			tempStorage, err = models.StorageModel.FindByID(ctx, tempStorageID)
+			if err != nil || tempStorage.Type != enums.StorageTypeS3 {
+				return fmt.Errorf("migration temp storage %s unavailable", tempStorageID)
+			}
+			tempStorages[tempStorageID] = tempStorage
+		}
+		if err := downloader.DeleteFromS3(ctx, tempStorage, objectKey); err != nil {
+			return fmt.Errorf("delete migration temp object %s: %w", objectKey, err)
+		}
+	}
+
 	target := filepath.Join(config.AppConfig.StoragePath, fileID)
 	if filepath.Dir(target) != filepath.Clean(config.AppConfig.StoragePath) {
 		return fmt.Errorf("unsafe cleanup path %s", target)
@@ -207,6 +253,17 @@ func runCleanup(ctx context.Context, job *models.VideoProcess) error {
 	}}); err != nil {
 		return fmt.Errorf("close migration ingests: %w", err)
 	}
+
+	slug := derefStr(job.Slug)
+	if slug == "" {
+		slug = fileID
+	}
+	slugs := collectSlugs(ctx, fileID, slug)
+	cache.Del(ctx, redisKeysFor(slugs)...)
+	if err := purgePlaylistCache(ctx, slug, slugs, true); err != nil {
+		return fmt.Errorf("purge migrated playlist cache: %w", err)
+	}
+
 	completeStep(ctx, job.ID, "cleanup")
 	return nil
 }
