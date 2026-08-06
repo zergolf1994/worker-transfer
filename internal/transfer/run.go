@@ -189,8 +189,8 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 
 	if len(assets) == 0 {
 		// A migration retry may arrive after its DB cutover committed but before
-		// Temp cleanup or cache invalidation completed. Both operations are
-		// idempotent, so finish them before settling the job.
+		// the Temp cleanup handoff or cache invalidation completed. Both
+		// operations are idempotent, so finish them before settling the job.
 		if isMigration {
 			if err := finalizeMigrationIngests(ctx, fileID, migrationID, sourceStorageID); err != nil {
 				return fmt.Errorf("finalize migrated ingest: %w", err)
@@ -331,7 +331,7 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 
 	// Regular transfer ingests can be closed now. Migration ingests move to
 	// "installed" in the media cutover transaction, then this INSTALL job
-	// removes their Temp objects and closes them before cache invalidation.
+	// soft-deletes them for service-owned Temp cleanup before cache invalidation.
 	for _, a := range assets {
 		if !isMigration {
 			softDeleteIngest(ctx, a.ingest.ID, slug, a.fileName)

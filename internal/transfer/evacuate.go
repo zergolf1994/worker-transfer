@@ -12,7 +12,6 @@ import (
 	"worker-transfer/internal/core/enums"
 	"worker-transfer/internal/core/utils"
 	"worker-transfer/internal/db/models"
-	"worker-transfer/internal/downloader"
 	"worker-transfer/internal/queue"
 	"worker-transfer/internal/uploader"
 
@@ -204,55 +203,10 @@ func runCleanup(ctx context.Context, job *models.VideoProcess) error {
 	return nil
 }
 
-// finalizeMigrationIngests removes the staged objects only after the media
-// cutover transaction has committed. DeleteObject is idempotent, so a retry
-// after an interrupted database update safely repeats the S3 deletion.
+// finalizeMigrationIngests hands Temp cleanup to vdohide-service only after
+// the media cutover transaction has committed. The service owns version-aware
+// S3 deletion and keeps the soft-deleted ingest as its retry pointer.
 func finalizeMigrationIngests(ctx context.Context, fileID, migrationID, sourceStorageID string) error {
-	ingestCursor, err := models.IngestModel.FindRaw(ctx, bson.M{
-		"fileId":          fileID,
-		"migrationId":     migrationID,
-		"sourceStorageId": sourceStorageID,
-		"sourceType":      enums.IngestSourceTypeMigration,
-		"migrationState":  enums.IngestMigrationStateInstalled,
-		"deletedAt":       bson.M{"$exists": false},
-	})
-	if err != nil {
-		return fmt.Errorf("load installed migration ingests: %w", err)
-	}
-	defer ingestCursor.Close(ctx)
-
-	installedIngests := make([]models.Ingest, 0, 1)
-	for ingestCursor.Next(ctx) {
-		var ingest models.Ingest
-		if err := ingestCursor.Decode(&ingest); err != nil {
-			return fmt.Errorf("decode installed migration ingest: %w", err)
-		}
-		installedIngests = append(installedIngests, ingest)
-	}
-	if err := ingestCursor.Err(); err != nil {
-		return fmt.Errorf("scan installed migration ingests: %w", err)
-	}
-
-	tempStorages := map[string]*models.Storage{}
-	for _, ingest := range installedIngests {
-		tempStorageID := derefStr(ingest.StorageID)
-		objectKey := derefStr(ingest.Path)
-		if tempStorageID == "" || objectKey == "" {
-			return fmt.Errorf("migration ingest %s has no temp storage or object path", ingest.ID)
-		}
-		tempStorage, ok := tempStorages[tempStorageID]
-		if !ok {
-			tempStorage, err = models.StorageModel.FindByID(ctx, tempStorageID)
-			if err != nil || tempStorage.Type != enums.StorageTypeS3 {
-				return fmt.Errorf("migration temp storage %s unavailable", tempStorageID)
-			}
-			tempStorages[tempStorageID] = tempStorage
-		}
-		if err := downloader.DeleteFromS3(ctx, tempStorage, objectKey); err != nil {
-			return fmt.Errorf("delete migration temp object %s: %w", objectKey, err)
-		}
-	}
-
 	now := time.Now()
 	if _, err := models.IngestModel.UpdateMany(ctx, bson.M{
 		"fileId":          fileID,
