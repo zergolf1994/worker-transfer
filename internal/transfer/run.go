@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"worker-transfer/internal/cache"
@@ -81,12 +80,7 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 	procLogger := utils.NewProcessLogger(slug)
 	defer procLogger.Close()
 
-	exePath, _ := os.Executable()
-	baseDir := filepath.Dir(exePath)
-	if strings.Contains(exePath, "go-build") {
-		baseDir, _ = os.Getwd()
-	}
-	workDir := filepath.Join(baseDir, "transfer", slug)
+	workDir := transferWorkDir(slug)
 	os.MkdirAll(workDir, 0755)
 
 	var success bool
@@ -190,6 +184,16 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 	}
 
 	if len(assets) == 0 {
+		// A migration retry may arrive after its DB cutover committed but before
+		// cache invalidation completed. Re-run the idempotent invalidation before
+		// settling the job so the new media slugs become visible.
+		if isMigration {
+			slugs := collectSlugs(ctx, fileID, slug)
+			cache.Del(ctx, redisKeysFor(slugs)...)
+			if err := purgePlaylistCache(ctx, slug, slugs, false); err != nil {
+				return fmt.Errorf("purge migrated playlist cache: %w", err)
+			}
+		}
 		// enqueuer queued a file with nothing pending — treat as done, not failed
 		utils.LogMain("⏭️  [%s] Nothing to transfer (no open ingests) — completing", slug)
 		success = true
@@ -232,7 +236,7 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 	}
 	completeStep(ctx, job.ID, "install")
 
-	// ─── STEP 4: MEDIA RECORDS + ingest cleanup ───────────────
+	// ─── STEP 4: MEDIA RECORDS + migration cutover ─────────────
 	startStep(ctx, job.ID, "media")
 	now := time.Now()
 	mimeType := "video/mp4"
@@ -250,13 +254,10 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 			if ingest == nil {
 				return fmt.Errorf("migration ingest missing for %s", res)
 			}
-			if err := migrateMediaRecord(ctx, ingest, storageID, fileID, res, enums.MediaTypeVideo); err != nil {
+			if err := cutoverMigrationMedia(ctx, ingest, storageID, fileID, res, enums.MediaTypeVideo); err != nil {
 				return fmt.Errorf("migrate media %s: %w", res, err)
 			}
 			utils.LogMain("✅ [%s] Media moved: %s", slug, res)
-			if isPurgeResolution(res) {
-				needCfPurge = true
-			}
 			continue
 		}
 		if hasVideoMedia(ctx, fileID, res) {
@@ -290,7 +291,7 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 		if spriteIngest == nil {
 			return fmt.Errorf("migration ingest missing for sprite")
 		}
-		if err := migrateMediaRecord(ctx, spriteIngest, storageID, fileID, "", enums.MediaTypeThumbnail); err != nil {
+		if err := cutoverMigrationMedia(ctx, spriteIngest, storageID, fileID, "", enums.MediaTypeThumbnail); err != nil {
 			return fmt.Errorf("migrate thumbnail media: %w", err)
 		}
 		utils.LogMain("✅ [%s] Media moved: thumbnail", slug)
@@ -321,15 +322,11 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 		utils.LogMain("✅ [%s] Media record: thumbnail", slug)
 	}
 
-	// media records exist → now it's safe to burn the ingests. (Doing this
-	// LAST means a failed install retries with ingests intact — unlike the
-	// old worker, which deleted them right after download.)
+	// Regular transfer ingests can be closed now. Migration ingests are moved
+	// to "installed" inside the same transaction that creates new media/clone
+	// records and soft-deletes the old records; cleanup closes them after S3.
 	for _, a := range assets {
-		if isMigration {
-			if err := markMigrationIngestInstalled(ctx, a.ingest.ID, slug, a.fileName); err != nil {
-				return err
-			}
-		} else {
+		if !isMigration {
 			softDeleteIngest(ctx, a.ingest.ID, slug, a.fileName)
 		}
 	}
@@ -338,13 +335,17 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 	// ─── Cache invalidation (ครั้งเดียวต่อ job — ไฟล์ + clones) ──
 	// Redis: ลบ playlist_master/playlist_json/embed_resolve ทุกครั้งที่มี
 	//   media ใหม่ (รวม sprite — embed/feed เปลี่ยน) | ไม่ตั้ง REDIS_URL = no-op
-	// Cloudflare: purge playlist.m3u8 when a rendition changes; migration
-	// cutovers also purge video.m3u8 because the backing storage changed —
+	// Cloudflare: purge playlist.m3u8 after media creation/cutover so cached
+	// playlists immediately pick up the new media slugs —
 	//   ไม่ได้ผูก domain_bindings.playlist = ข้าม
 	if len(installedRes) > 0 || hasSpriteZip {
 		slugs := collectSlugs(ctx, fileID, slug)
 		cache.Del(ctx, redisKeysFor(slugs)...)
-		if needCfPurge && !isMigration {
+		if isMigration {
+			if err := purgePlaylistCache(ctx, slug, slugs, false); err != nil {
+				return fmt.Errorf("purge migrated playlist cache: %w", err)
+			}
+		} else if needCfPurge {
 			_ = purgePlaylistCache(ctx, slug, slugs, false)
 		}
 	}

@@ -2,12 +2,12 @@ package transfer
 
 import (
 	"context"
+	goerrors "errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
 
-	"worker-transfer/internal/cache"
 	"worker-transfer/internal/config"
 	"worker-transfer/internal/core/enums"
 	"worker-transfer/internal/core/utils"
@@ -56,11 +56,16 @@ func runEvacuate(ctx context.Context, job *models.VideoProcess) error {
 	utils.LogMain("📤 [%s] START EVACUATE (%s → S3 temp)", slug, sourceStorageID)
 	startStep(ctx, job.ID, "scan")
 
-	workDir := filepath.Join(os.TempDir(), "worker-transfer-evacuate", job.ID)
+	workDir := transferWorkDir(slug)
 	if err := os.MkdirAll(workDir, 0755); err != nil {
 		return fmt.Errorf("create evacuation workdir: %w", err)
 	}
-	defer os.RemoveAll(workDir)
+	var success bool
+	defer func() {
+		if success || goerrors.Is(context.Cause(ctx), queue.ErrJobCancelled) {
+			_ = os.RemoveAll(workDir)
+		}
+	}()
 
 	cursor, err := models.MediaModel.FindRaw(ctx, bson.M{
 		"_id":       bson.M{"$in": job.SourceMediaIDs},
@@ -160,6 +165,7 @@ func runEvacuate(ctx context.Context, job *models.VideoProcess) error {
 	startStep(ctx, job.ID, "ingest")
 	completeStep(ctx, job.ID, "ingest")
 	utils.LogMain("✅ [%s] EVACUATE STAGED (%d asset(s))", slug, len(assets))
+	success = true
 	return nil
 }
 
@@ -232,13 +238,6 @@ func runCleanup(ctx context.Context, job *models.VideoProcess) error {
 		}
 	}
 
-	target := filepath.Join(config.AppConfig.StoragePath, fileID)
-	if filepath.Dir(target) != filepath.Clean(config.AppConfig.StoragePath) {
-		return fmt.Errorf("unsafe cleanup path %s", target)
-	}
-	if err := os.RemoveAll(target); err != nil {
-		return fmt.Errorf("remove source directory: %w", err)
-	}
 	now := time.Now()
 	if _, err := models.IngestModel.UpdateMany(ctx, bson.M{
 		"migrationId":     migrationID,
@@ -252,16 +251,6 @@ func runCleanup(ctx context.Context, job *models.VideoProcess) error {
 		"updatedAt":      now,
 	}}); err != nil {
 		return fmt.Errorf("close migration ingests: %w", err)
-	}
-
-	slug := derefStr(job.Slug)
-	if slug == "" {
-		slug = fileID
-	}
-	slugs := collectSlugs(ctx, fileID, slug)
-	cache.Del(ctx, redisKeysFor(slugs)...)
-	if err := purgePlaylistCache(ctx, slug, slugs, true); err != nil {
-		return fmt.Errorf("purge migrated playlist cache: %w", err)
 	}
 
 	completeStep(ctx, job.ID, "cleanup")

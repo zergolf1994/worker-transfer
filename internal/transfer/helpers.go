@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -13,7 +15,9 @@ import (
 	"worker-transfer/internal/db/models"
 
 	"github.com/google/uuid"
+	"github.com/zergolf1994/goose"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
@@ -24,6 +28,18 @@ func derefStr(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// transferWorkDir mirrors worker-download's executable-relative temp layout.
+// Keeping retries under the worker directory makes failed work inspectable and
+// avoids relying on the host's global temp directory.
+func transferWorkDir(slug string) string {
+	exePath, _ := os.Executable()
+	baseDir := filepath.Dir(exePath)
+	if strings.Contains(exePath, "go-build") {
+		baseDir, _ = os.Getwd()
+	}
+	return filepath.Join(baseDir, "transfer", slug)
 }
 
 // ─── Local storage gating ─────────────────────────────────────
@@ -170,21 +186,7 @@ func softDeleteIngest(ctx context.Context, ingestID, slug, label string) {
 	log.Printf("🗑️  [%s] Soft-deleted ingest: %s", slug, label)
 }
 
-func markMigrationIngestInstalled(ctx context.Context, ingestID, slug, label string) error {
-	now := time.Now()
-	if _, err := models.IngestModel.FindByIDAndUpdate(ctx, ingestID, bson.M{
-		"$set": bson.M{
-			"migrationState": enums.IngestMigrationStateInstalled,
-			"updatedAt":      now,
-		},
-	}); err != nil {
-		log.Printf("⚠️  [%s] mark migration ingest installed %s: %v", slug, label, err)
-		return fmt.Errorf("mark migration ingest installed %s: %w", label, err)
-	}
-	return nil
-}
-
-func migrateMediaRecord(
+func cutoverMigrationMedia(
 	ctx context.Context,
 	ingest *models.Ingest,
 	targetStorageID string,
@@ -197,37 +199,82 @@ func migrateMediaRecord(
 	if sourceMediaID == "" || sourceStorageID == "" {
 		return fmt.Errorf("migration ingest has no source media reference")
 	}
-	now := time.Now()
-	updated, err := models.MediaModel.FindOneAndUpdate(ctx,
-		bson.M{
+	return goose.WithTransaction(ctx, func(sc mongo.SessionContext) (interface{}, error) {
+		source, err := models.MediaModel.FindOne(sc, bson.M{
 			"_id":       sourceMediaID,
 			"fileId":    fileID,
-			"storageId": bson.M{"$in": []string{sourceStorageID, targetStorageID}},
+			"storageId": sourceStorageID,
 			"deletedAt": bson.M{"$exists": false},
-		},
-		bson.M{"$set": bson.M{
-			"storageId": targetStorageID,
-			"updatedAt": now,
-		}},
-		options.FindOneAndUpdate().SetReturnDocument(options.After),
-	)
-	if err != nil || updated == nil {
-		return fmt.Errorf("source media %s was changed or removed", sourceMediaID)
-	}
-	cloneFilter := bson.M{
-		"clonedFrom": fileID,
-		"type":       mediaType,
-		"storageId":  sourceStorageID,
-		"deletedAt":  bson.M{"$exists": false},
-	}
-	if resolution != "" {
-		cloneFilter["resolution"] = resolution
-	}
-	_, err = models.MediaModel.UpdateMany(ctx, cloneFilter, bson.M{"$set": bson.M{
-		"storageId": targetStorageID,
-		"updatedAt": now,
-	}})
-	return err
+		})
+		if err != nil {
+			return nil, fmt.Errorf("source media %s was changed or removed: %w", sourceMediaID, err)
+		}
+
+		cloneFilter := bson.M{
+			"clonedFrom": fileID,
+			"type":       mediaType,
+			"storageId":  sourceStorageID,
+			"deletedAt":  bson.M{"$exists": false},
+		}
+		if resolution != "" {
+			cloneFilter["resolution"] = resolution
+		}
+		cloneCursor, err := models.MediaModel.FindRaw(sc, cloneFilter)
+		if err != nil {
+			return nil, fmt.Errorf("load cloned source media: %w", err)
+		}
+		defer cloneCursor.Close(sc)
+
+		oldMedias := []models.Media{*source}
+		for cloneCursor.Next(sc) {
+			var clone models.Media
+			if err := cloneCursor.Decode(&clone); err != nil {
+				return nil, fmt.Errorf("decode cloned source media: %w", err)
+			}
+			oldMedias = append(oldMedias, clone)
+		}
+		if err := cloneCursor.Err(); err != nil {
+			return nil, fmt.Errorf("scan cloned source media: %w", err)
+		}
+
+		now := time.Now()
+		oldIDs := make([]string, 0, len(oldMedias))
+		for _, oldMedia := range oldMedias {
+			newMedia := oldMedia
+			newMedia.ID = newUUID()
+			newMedia.Slug = utils.RandomString(11, false)
+			newMedia.StorageID = &targetStorageID
+			newMedia.Prewarm = nil
+			newMedia.DeletedAt = nil
+			newMedia.CreatedAt = now
+			newMedia.UpdatedAt = now
+			if _, err := models.MediaModel.Create(sc, &newMedia); err != nil {
+				return nil, fmt.Errorf("create migrated media for %s: %w", oldMedia.ID, err)
+			}
+			oldIDs = append(oldIDs, oldMedia.ID)
+		}
+
+		if _, err := models.MediaModel.UpdateMany(sc, bson.M{
+			"_id":       bson.M{"$in": oldIDs},
+			"storageId": sourceStorageID,
+			"deletedAt": bson.M{"$exists": false},
+		}, bson.M{"$set": bson.M{"deletedAt": now, "updatedAt": now}}); err != nil {
+			return nil, fmt.Errorf("soft-delete source media: %w", err)
+		}
+
+		if _, err := models.IngestModel.FindOneAndUpdate(sc, bson.M{
+			"_id":            ingest.ID,
+			"migrationState": enums.IngestMigrationStateStaged,
+			"deletedAt":      bson.M{"$exists": false},
+		}, bson.M{"$set": bson.M{
+			"migrationState": enums.IngestMigrationStateInstalled,
+			"updatedAt":      now,
+		}}, options.FindOneAndUpdate().SetReturnDocument(options.After)); err != nil {
+			return nil, fmt.Errorf("mark migration ingest installed: %w", err)
+		}
+
+		return nil, nil
+	})
 }
 
 // ─── Clone propagation ───────────────────────────────────────
