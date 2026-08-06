@@ -8,11 +8,12 @@ const (
 )
 
 const (
-	StorageDrainStateIdle      = "idle"
-	StorageDrainStateRequested = "requested"
-	StorageDrainStateDraining  = "draining"
-	StorageDrainStateBlocked   = "blocked"
-	StorageDrainStateCompleted = "completed"
+	StorageDrainStateIdle       = "idle"
+	StorageDrainStateRequested  = "requested"
+	StorageDrainStateDraining   = "draining"
+	StorageDrainStateCancelling = "cancelling"
+	StorageDrainStateBlocked    = "blocked"
+	StorageDrainStateCompleted  = "completed"
 )
 
 // ─── Storage Statuses ────────────────────────────────────────────────

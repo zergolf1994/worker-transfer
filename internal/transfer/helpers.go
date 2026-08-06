@@ -50,6 +50,7 @@ func localStorageBlockReason(ctx context.Context) string {
 	}
 	if !storage.Enable && storage.DrainState != enums.StorageDrainStateRequested &&
 		storage.DrainState != enums.StorageDrainStateDraining &&
+		storage.DrainState != enums.StorageDrainStateCancelling &&
 		storage.DrainState != enums.StorageDrainStateBlocked {
 		return "local_storage_disabled"
 	}
@@ -86,6 +87,7 @@ func drainStorageBlockReason(ctx context.Context) string {
 	}
 	if storage.DrainState != enums.StorageDrainStateRequested &&
 		storage.DrainState != enums.StorageDrainStateDraining &&
+		storage.DrainState != enums.StorageDrainStateCancelling &&
 		storage.DrainState != enums.StorageDrainStateBlocked {
 		return "local_storage_not_draining"
 	}
@@ -434,12 +436,14 @@ func asBsonM(v interface{}) (bson.M, bool) {
 	}
 }
 
-// purgePlaylistCache purges playlist.m3u8 from Cloudflare for all slugs.
+// purgePlaylistCache always purges playlist.m3u8. Migration cutovers also
+// purge video.m3u8 because the media storage backing the rendition changed.
 // ไม่ได้ผูก CF profile (domain_bindings.playlist) → ข้ามเงียบๆ
 func purgePlaylistCache(
 	ctx context.Context,
 	slug string,
 	slugs []string,
+	includeVideoPlaylist bool,
 ) {
 	domainSetting, err := models.SettingModel.FindOne(ctx, bson.M{"name": enums.SettingDomainPlaylist})
 	if err != nil {
@@ -463,9 +467,16 @@ func purgePlaylistCache(
 		return
 	}
 
-	purgeURLs := make([]string, 0, len(slugs))
+	urlsPerSlug := 1
+	if includeVideoPlaylist {
+		urlsPerSlug = 2
+	}
+	purgeURLs := make([]string, 0, len(slugs)*urlsPerSlug)
 	for _, s := range slugs {
 		purgeURLs = append(purgeURLs, fmt.Sprintf("%s/%s/playlist.m3u8", domain, s))
+		if includeVideoPlaylist {
+			purgeURLs = append(purgeURLs, fmt.Sprintf("%s/%s/video.m3u8", domain, s))
+		}
 	}
 	if len(purgeURLs) == 0 {
 		return

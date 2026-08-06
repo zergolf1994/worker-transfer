@@ -45,6 +45,7 @@ func Claim(ctx context.Context, workerID string) (*models.VideoProcess, error) {
 	if storage.Status == enums.StorageStatusOnline &&
 		(storage.DrainState == enums.StorageDrainStateRequested ||
 			storage.DrainState == enums.StorageDrainStateDraining ||
+			storage.DrainState == enums.StorageDrainStateCancelling ||
 			storage.DrainState == enums.StorageDrainStateBlocked) {
 		assignments = append(assignments, bson.M{
 			"transferMode":    bson.M{"$in": []string{enums.TransferModeEvacuate, enums.TransferModeCleanup}},

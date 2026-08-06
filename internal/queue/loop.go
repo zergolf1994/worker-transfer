@@ -113,6 +113,7 @@ func storageIsDraining(ctx context.Context) bool {
 	}
 	return storage.DrainState == enums.StorageDrainStateRequested ||
 		storage.DrainState == enums.StorageDrainStateDraining ||
+		storage.DrainState == enums.StorageDrainStateCancelling ||
 		storage.DrainState == enums.StorageDrainStateBlocked
 }
 

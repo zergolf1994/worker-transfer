@@ -338,13 +338,14 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 	// ─── Cache invalidation (ครั้งเดียวต่อ job — ไฟล์ + clones) ──
 	// Redis: ลบ playlist_master/playlist_json/embed_resolve ทุกครั้งที่มี
 	//   media ใหม่ (รวม sprite — embed/feed เปลี่ยน) | ไม่ตั้ง REDIS_URL = no-op
-	// Cloudflare: purge playlist.m3u8 เฉพาะตอน resolution ใหม่ลง —
+	// Cloudflare: purge playlist.m3u8 when a rendition changes; migration
+	// cutovers also purge video.m3u8 because the backing storage changed —
 	//   ไม่ได้ผูก domain_bindings.playlist = ข้าม
 	if len(installedRes) > 0 || hasSpriteZip {
 		slugs := collectSlugs(ctx, fileID, slug)
 		cache.Del(ctx, redisKeysFor(slugs)...)
 		if needCfPurge {
-			purgePlaylistCache(ctx, slug, slugs)
+			purgePlaylistCache(ctx, slug, slugs, isMigration)
 		}
 	}
 
