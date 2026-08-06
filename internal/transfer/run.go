@@ -386,7 +386,7 @@ func invalidateMigrationCache(ctx context.Context, fileID, slug, migrationID str
 	if err := purgePlaylistCache(ctx, slug, slugs, false); err != nil {
 		return fmt.Errorf("purge migration %s playlist cache: %w", migrationID, err)
 	}
-	utils.LogMain("☁️  [%s] Migration cache invalidated (%d playlist(s))", slug, len(slugs))
+	utils.LogMain("☁️  [%s] Migration cache invalidation completed (%d playlist(s))", slug, len(slugs))
 	return nil
 }
 

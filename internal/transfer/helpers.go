@@ -483,8 +483,8 @@ func asBsonM(v interface{}) (bson.M, bool) {
 	}
 }
 
-// purgePlaylistCache always purges playlist.m3u8. Missing domain/profile
-// configuration is an error so required migration invalidation can retry.
+// purgePlaylistCache always purges playlist.m3u8 when a playlist profile is
+// configured. No profile means Cloudflare purge is intentionally disabled.
 func purgePlaylistCache(
 	ctx context.Context,
 	slug string,
@@ -509,7 +509,7 @@ func purgePlaylistCache(
 	cfConfig := resolveCfProfile(ctx, "playlist")
 	if cfConfig.ZoneID == "" || cfConfig.APIToken == "" {
 		log.Printf("⚠️  [%s] Cloudflare purge skipped: playlist profile is not configured", slug)
-		return fmt.Errorf("playlist Cloudflare profile is not configured")
+		return nil
 	}
 
 	urlsPerSlug := 1
