@@ -179,11 +179,14 @@ func runCleanup(ctx context.Context, job *models.VideoProcess) error {
 	if fileID == "" || migrationID == "" || sourceStorageID != config.AppConfig.StorageId {
 		return fmt.Errorf("cleanup job is missing migration routing fields")
 	}
+	if len(job.SourceMediaIDs) == 0 {
+		return fmt.Errorf("cleanup job has no source media reference")
+	}
 	startStep(ctx, job.ID, "verify")
 	refs, err := models.MediaModel.CountDocuments(ctx, bson.M{
+		"_id":       bson.M{"$in": job.SourceMediaIDs},
 		"storageId": sourceStorageID,
 		"deletedAt": bson.M{"$exists": false},
-		"$or":       []bson.M{{"fileId": fileID}, {"clonedFrom": fileID}},
 	})
 	if err != nil {
 		return fmt.Errorf("verify source references: %w", err)

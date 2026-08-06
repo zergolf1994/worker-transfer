@@ -181,12 +181,19 @@ func runJob(ctx context.Context, workerID string, job *models.VideoProcess, hand
 		// admin สั่งยกเลิก — doc เป็น cancelled แล้ว ห้ามไปเขียนทับ
 		log.Printf("⏹️ Job %s cancelled by admin (after %s)", job.ID, time.Since(start).Round(time.Second))
 
-	case ctx.Err() != nil || errors.Is(err, context.Canceled), errors.Is(err, ErrJobRequeue):
-		// shutdown / disk เต็ม — ไม่ใช่ความผิดของงาน คืนเข้าคิวไม่นับ retry
+	case ctx.Err() != nil || errors.Is(err, context.Canceled):
+		// shutdown — คืนเข้าคิวทันทีโดยไม่นับ retry
 		if e := Release(settleCtx, job.ID); e != nil {
 			log.Printf("⚠️ Release failed for job %s: %v", job.ID, e)
 		}
 		log.Printf("↩️ Job %s released back to queue: %v", job.ID, err)
+
+	case errors.Is(err, ErrJobRequeue):
+		// Dependency/disk gate — delay prevents immediate reclaim tight loops.
+		if e := ReleaseAfter(settleCtx, job.ID, 15*time.Second); e != nil {
+			log.Printf("⚠️ Delayed release failed for job %s: %v", job.ID, e)
+		}
+		log.Printf("↩️ Job %s released back to queue for 15s: %v", job.ID, err)
 
 	default:
 		retried, e := RetryOrFail(settleCtx, job, err.Error(), categorize(err))

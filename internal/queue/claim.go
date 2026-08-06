@@ -197,3 +197,26 @@ func Release(ctx context.Context, jobID string) error {
 	}
 	return err
 }
+
+// ReleaseAfter returns a non-faulting job to pending with a short delay.
+// This prevents a worker from immediately reclaiming a dependency-blocked
+// job in a tight loop while still preserving its retry count.
+func ReleaseAfter(ctx context.Context, jobID string, delay time.Duration) error {
+	_, err := models.VideoProcessModel.FindOneAndUpdate(ctx,
+		bson.M{
+			"_id":    jobID,
+			"status": enums.ProcessStatusProcessing,
+		},
+		bson.M{
+			"$set": bson.M{
+				"status":      enums.ProcessStatusPending,
+				"nextRetryAt": time.Now().Add(delay),
+			},
+			"$unset": bson.M{"workerId": "", "claimedAt": ""},
+		},
+	)
+	if err != nil && errors.Is(err, mongo.ErrNoDocuments) {
+		return nil
+	}
+	return err
+}
