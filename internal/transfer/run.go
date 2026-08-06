@@ -65,8 +65,12 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 	slug := derefStr(job.Slug)
 	migrationID := derefStr(job.MigrationID)
 	isMigration := migrationID != ""
+	sourceStorageID := derefStr(job.SourceStorageID)
 	if fileID == "" {
 		return fmt.Errorf("job has no fileId")
+	}
+	if isMigration && sourceStorageID == "" {
+		return fmt.Errorf("migration job has no sourceStorageId")
 	}
 
 	storagePath := config.AppConfig.StoragePath
@@ -80,7 +84,7 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 	procLogger := utils.NewProcessLogger(slug)
 	defer procLogger.Close()
 
-	workDir := transferWorkDir(slug)
+	workDir := transferWorkDir(slug, job.ID)
 	os.MkdirAll(workDir, 0755)
 
 	var success bool
@@ -185,9 +189,12 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 
 	if len(assets) == 0 {
 		// A migration retry may arrive after its DB cutover committed but before
-		// cache invalidation completed. Re-run the idempotent invalidation before
-		// settling the job so the new media slugs become visible.
+		// Temp cleanup or cache invalidation completed. Both operations are
+		// idempotent, so finish them before settling the job.
 		if isMigration {
+			if err := finalizeMigrationIngests(ctx, fileID, migrationID, sourceStorageID); err != nil {
+				return fmt.Errorf("finalize migrated ingest: %w", err)
+			}
 			slugs := collectSlugs(ctx, fileID, slug)
 			cache.Del(ctx, redisKeysFor(slugs)...)
 			if err := purgePlaylistCache(ctx, slug, slugs, false); err != nil {
@@ -322,12 +329,17 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 		utils.LogMain("✅ [%s] Media record: thumbnail", slug)
 	}
 
-	// Regular transfer ingests can be closed now. Migration ingests are moved
-	// to "installed" inside the same transaction that creates new media/clone
-	// records and soft-deletes the old records; cleanup closes them after S3.
+	// Regular transfer ingests can be closed now. Migration ingests move to
+	// "installed" in the media cutover transaction, then this INSTALL job
+	// removes their Temp objects and closes them before cache invalidation.
 	for _, a := range assets {
 		if !isMigration {
 			softDeleteIngest(ctx, a.ingest.ID, slug, a.fileName)
+		}
+	}
+	if isMigration {
+		if err := finalizeMigrationIngests(ctx, fileID, migrationID, sourceStorageID); err != nil {
+			return fmt.Errorf("finalize migrated ingest: %w", err)
 		}
 	}
 	completeStep(ctx, job.ID, "media")

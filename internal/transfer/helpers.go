@@ -33,13 +33,13 @@ func derefStr(s *string) string {
 // transferWorkDir mirrors worker-download's executable-relative temp layout.
 // Keeping retries under the worker directory makes failed work inspectable and
 // avoids relying on the host's global temp directory.
-func transferWorkDir(slug string) string {
+func transferWorkDir(slug, jobID string) string {
 	exePath, _ := os.Executable()
 	baseDir := filepath.Dir(exePath)
 	if strings.Contains(exePath, "go-build") {
 		baseDir, _ = os.Getwd()
 	}
-	return filepath.Join(baseDir, "transfer", slug)
+	return filepath.Join(baseDir, "transfer", slug, jobID)
 }
 
 // ─── Local storage gating ─────────────────────────────────────

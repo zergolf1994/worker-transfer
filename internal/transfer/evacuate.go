@@ -56,7 +56,7 @@ func runEvacuate(ctx context.Context, job *models.VideoProcess) error {
 	utils.LogMain("📤 [%s] START EVACUATE (%s → S3 temp)", slug, sourceStorageID)
 	startStep(ctx, job.ID, "scan")
 
-	workDir := transferWorkDir(slug)
+	workDir := transferWorkDir(slug, job.ID)
 	if err := os.MkdirAll(workDir, 0755); err != nil {
 		return fmt.Errorf("create evacuation workdir: %w", err)
 	}
@@ -197,7 +197,19 @@ func runCleanup(ctx context.Context, job *models.VideoProcess) error {
 	completeStep(ctx, job.ID, "verify")
 
 	startStep(ctx, job.ID, "cleanup")
+	if err := finalizeMigrationIngests(ctx, fileID, migrationID, sourceStorageID); err != nil {
+		return err
+	}
+	completeStep(ctx, job.ID, "cleanup")
+	return nil
+}
+
+// finalizeMigrationIngests removes the staged objects only after the media
+// cutover transaction has committed. DeleteObject is idempotent, so a retry
+// after an interrupted database update safely repeats the S3 deletion.
+func finalizeMigrationIngests(ctx context.Context, fileID, migrationID, sourceStorageID string) error {
 	ingestCursor, err := models.IngestModel.FindRaw(ctx, bson.M{
+		"fileId":          fileID,
 		"migrationId":     migrationID,
 		"sourceStorageId": sourceStorageID,
 		"sourceType":      enums.IngestSourceTypeMigration,
@@ -209,7 +221,7 @@ func runCleanup(ctx context.Context, job *models.VideoProcess) error {
 	}
 	defer ingestCursor.Close(ctx)
 
-	installedIngests := make([]models.Ingest, 0, len(job.SourceMediaIDs))
+	installedIngests := make([]models.Ingest, 0, 1)
 	for ingestCursor.Next(ctx) {
 		var ingest models.Ingest
 		if err := ingestCursor.Decode(&ingest); err != nil {
@@ -243,6 +255,7 @@ func runCleanup(ctx context.Context, job *models.VideoProcess) error {
 
 	now := time.Now()
 	if _, err := models.IngestModel.UpdateMany(ctx, bson.M{
+		"fileId":          fileID,
 		"migrationId":     migrationID,
 		"sourceStorageId": sourceStorageID,
 		"sourceType":      enums.IngestSourceTypeMigration,
@@ -255,7 +268,5 @@ func runCleanup(ctx context.Context, job *models.VideoProcess) error {
 	}}); err != nil {
 		return fmt.Errorf("close migration ingests: %w", err)
 	}
-
-	completeStep(ctx, job.ID, "cleanup")
 	return nil
 }
