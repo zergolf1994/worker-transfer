@@ -64,7 +64,7 @@ func StartHeartbeat(ctx context.Context, workerID string) {
 		enable := true
 		if sys.DiskTotal > 0 {
 			diskPct := float64(sys.DiskUsed) / float64(sys.DiskTotal) * 100
-			if diskPct >= diskPauseThreshold {
+			if diskPct >= diskPauseThreshold && !storageIsDraining(hbCtx) {
 				status = enums.WorkerStatusPaused
 				enable = false
 				log.Printf("⚠️ Heartbeat: disk usage %.1f%% >= %.0f%% — enable=false", diskPct, diskPauseThreshold)
@@ -74,10 +74,10 @@ func StartHeartbeat(ctx context.Context, workerID string) {
 		now := time.Now()
 		update := bson.M{
 			"$set": bson.M{
-				"hostname":    hostname,
-				"ip":          ip,
-				"pid":         pid,
-				"type":        workerType,
+				"hostname": hostname,
+				"ip":       ip,
+				"pid":      pid,
+				"type":     workerType,
 				// enqueuer จับคู่ slot กับ storage ปลายทางด้วย field นี้
 				"storageId":   config.AppConfig.StorageId,
 				"status":      status,

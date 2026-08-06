@@ -67,7 +67,7 @@ func RunLoop(ctx context.Context, workerID string, handler JobHandler) {
 
 		// disk gate — heartbeat already sets enable=false, but the enqueuer
 		// may have queued jobs before the disk filled; don't claim them
-		if total, used, _ := getDiskUsage(config.AppConfig.StoragePath); total > 0 {
+		if total, used, _ := getDiskUsage(config.AppConfig.StoragePath); total > 0 && !storageIsDraining(ctx) {
 			if pct := float64(used) / float64(total) * 100; pct >= diskClaimThreshold {
 				sleepCtx(ctx, claimInterval)
 				continue
@@ -104,6 +104,16 @@ func RunLoop(ctx context.Context, workerID string, handler JobHandler) {
 		runJob(ctx, workerID, job, handler)
 		// no sleep — if there's another pending job, take it right away
 	}
+}
+
+func storageIsDraining(ctx context.Context) bool {
+	storage, err := models.StorageModel.FindByID(ctx, config.AppConfig.StorageId)
+	if err != nil {
+		return false
+	}
+	return storage.DrainState == enums.StorageDrainStateRequested ||
+		storage.DrainState == enums.StorageDrainStateDraining ||
+		storage.DrainState == enums.StorageDrainStateBlocked
 }
 
 // cancelPollInterval — ความถี่ที่ watcher เช็คว่า admin กดยกเลิกงานนี้หรือยัง

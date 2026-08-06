@@ -48,14 +48,46 @@ func localStorageBlockReason(ctx context.Context) string {
 	if err != nil {
 		return "local_storage_not_found"
 	}
-	if !storage.Enable {
+	if !storage.Enable && storage.DrainState != enums.StorageDrainStateRequested &&
+		storage.DrainState != enums.StorageDrainStateDraining &&
+		storage.DrainState != enums.StorageDrainStateBlocked {
 		return "local_storage_disabled"
 	}
 	if storage.Status != enums.StorageStatusOnline {
 		return "local_storage_not_online"
 	}
+	if storage.Enable && storage.Capacity != nil && storage.Capacity.Percentage >= storageCapacityMaxPercent {
+		return "local_storage_capacity_full"
+	}
+	return ""
+}
+
+func installStorageBlockReason(ctx context.Context) string {
+	if reason := localStorageBlockReason(ctx); reason != "" {
+		return reason
+	}
+	storage, err := models.StorageModel.FindByID(ctx, config.AppConfig.StorageId)
+	if err != nil || !storage.Enable {
+		return "local_storage_disabled"
+	}
 	if storage.Capacity != nil && storage.Capacity.Percentage >= storageCapacityMaxPercent {
 		return "local_storage_capacity_full"
+	}
+	return ""
+}
+
+func drainStorageBlockReason(ctx context.Context) string {
+	storage, err := models.StorageModel.FindByID(ctx, config.AppConfig.StorageId)
+	if err != nil {
+		return "local_storage_not_found"
+	}
+	if storage.Status != enums.StorageStatusOnline {
+		return "local_storage_not_online"
+	}
+	if storage.DrainState != enums.StorageDrainStateRequested &&
+		storage.DrainState != enums.StorageDrainStateDraining &&
+		storage.DrainState != enums.StorageDrainStateBlocked {
+		return "local_storage_not_draining"
 	}
 	return ""
 }
@@ -70,6 +102,21 @@ func pendingIngestFor(ctx context.Context, fileID, fileName string) *models.Inge
 		"fileName":   fileName,
 		"sourceType": enums.IngestSourceTypeProcessed,
 		"deletedAt":  bson.M{"$exists": false},
+	})
+	if err != nil {
+		return nil
+	}
+	return ingest
+}
+
+func pendingMigrationIngestFor(ctx context.Context, fileID, fileName, migrationID string) *models.Ingest {
+	ingest, err := models.IngestModel.FindOne(ctx, bson.M{
+		"fileId":         fileID,
+		"fileName":       fileName,
+		"sourceType":     enums.IngestSourceTypeMigration,
+		"migrationId":    migrationID,
+		"migrationState": enums.IngestMigrationStateStaged,
+		"deletedAt":      bson.M{"$exists": false},
 	})
 	if err != nil {
 		return nil
@@ -119,6 +166,66 @@ func softDeleteIngest(ctx context.Context, ingestID, slug, label string) {
 		return
 	}
 	log.Printf("🗑️  [%s] Soft-deleted ingest: %s", slug, label)
+}
+
+func markMigrationIngestInstalled(ctx context.Context, ingestID, slug, label string) error {
+	now := time.Now()
+	if _, err := models.IngestModel.FindByIDAndUpdate(ctx, ingestID, bson.M{
+		"$set": bson.M{
+			"migrationState": enums.IngestMigrationStateInstalled,
+			"updatedAt":      now,
+		},
+	}); err != nil {
+		log.Printf("⚠️  [%s] mark migration ingest installed %s: %v", slug, label, err)
+		return fmt.Errorf("mark migration ingest installed %s: %w", label, err)
+	}
+	return nil
+}
+
+func migrateMediaRecord(
+	ctx context.Context,
+	ingest *models.Ingest,
+	targetStorageID string,
+	fileID string,
+	resolution string,
+	mediaType string,
+) error {
+	sourceMediaID := derefStr(ingest.SourceMediaID)
+	sourceStorageID := derefStr(ingest.SourceStorageID)
+	if sourceMediaID == "" || sourceStorageID == "" {
+		return fmt.Errorf("migration ingest has no source media reference")
+	}
+	now := time.Now()
+	updated, err := models.MediaModel.FindOneAndUpdate(ctx,
+		bson.M{
+			"_id":       sourceMediaID,
+			"fileId":    fileID,
+			"storageId": bson.M{"$in": []string{sourceStorageID, targetStorageID}},
+			"deletedAt": bson.M{"$exists": false},
+		},
+		bson.M{"$set": bson.M{
+			"storageId": targetStorageID,
+			"updatedAt": now,
+		}},
+		options.FindOneAndUpdate().SetReturnDocument(options.After),
+	)
+	if err != nil || updated == nil {
+		return fmt.Errorf("source media %s was changed or removed", sourceMediaID)
+	}
+	cloneFilter := bson.M{
+		"clonedFrom": fileID,
+		"type":       mediaType,
+		"storageId":  sourceStorageID,
+		"deletedAt":  bson.M{"$exists": false},
+	}
+	if resolution != "" {
+		cloneFilter["resolution"] = resolution
+	}
+	_, err = models.MediaModel.UpdateMany(ctx, cloneFilter, bson.M{"$set": bson.M{
+		"storageId": targetStorageID,
+		"updatedAt": now,
+	}})
+	return err
 }
 
 // ─── Clone propagation ───────────────────────────────────────
@@ -238,9 +345,7 @@ func collectSlugs(ctx context.Context, fileID, slug string) []string {
 	return slugs
 }
 
-// redisKeysFor คืน key แคชฝั่ง content-node/player-node ของแต่ละ slug
-// (playlist_master = response cache ของ playlist.m3u8, playlist_json =
-// JW feed, embed_resolve = lookup ของหน้า embed)
+// redisKeysFor returns content-node/player-node cache keys for every file slug.
 func redisKeysFor(slugs []string) []string {
 	keys := make([]string, 0, len(slugs)*3)
 	for _, s := range slugs {
@@ -251,6 +356,15 @@ func redisKeysFor(slugs []string) []string {
 		)
 	}
 	return keys
+}
+
+func isPurgeResolution(res string) bool {
+	switch res {
+	case enums.Resolution360, enums.Resolution480, enums.Resolution720, enums.Resolution1080:
+		return true
+	default:
+		return false
+	}
 }
 
 // ─── Cloudflare playlist purge ───────────────────────────────
@@ -320,24 +434,21 @@ func asBsonM(v interface{}) (bson.M, bool) {
 	}
 }
 
-func isPurgeResolution(res string) bool {
-	switch res {
-	case enums.Resolution360, enums.Resolution480, enums.Resolution720, enums.Resolution1080:
-		return true
-	default:
-		return false
-	}
-}
-
 // purgePlaylistCache purges playlist.m3u8 from Cloudflare for all slugs.
 // ไม่ได้ผูก CF profile (domain_bindings.playlist) → ข้ามเงียบๆ
-func purgePlaylistCache(ctx context.Context, slug string, slugs []string) {
+func purgePlaylistCache(
+	ctx context.Context,
+	slug string,
+	slugs []string,
+) {
 	domainSetting, err := models.SettingModel.FindOne(ctx, bson.M{"name": enums.SettingDomainPlaylist})
 	if err != nil {
+		log.Printf("⚠️  [%s] Cloudflare purge skipped: domain_playlist is unavailable", slug)
 		return
 	}
 	domain := domainSetting.GetString("")
 	if domain == "" {
+		log.Printf("⚠️  [%s] Cloudflare purge skipped: domain_playlist is empty", slug)
 		return
 	}
 	if !strings.HasPrefix(domain, "http://") && !strings.HasPrefix(domain, "https://") {
@@ -347,6 +458,7 @@ func purgePlaylistCache(ctx context.Context, slug string, slugs []string) {
 
 	cfConfig := resolveCfProfile(ctx, "playlist")
 	if cfConfig.ZoneID == "" || cfConfig.APIToken == "" {
+		log.Printf("⚠️  [%s] Cloudflare purge skipped: playlist profile is not configured", slug)
 		// ไม่ได้ผูก CF profile — ข้ามเงียบๆ (ตั้งใจ ไม่ใช่ error)
 		return
 	}
@@ -364,4 +476,3 @@ func purgePlaylistCache(ctx context.Context, slug string, slugs []string) {
 		log.Printf("⚠️  [%s] Cloudflare purge failed: %v", slug, err)
 	}
 }
-

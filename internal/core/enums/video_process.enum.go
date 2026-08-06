@@ -12,6 +12,12 @@ const (
 	ProcessTypeSpritesheet = "spritesheet"
 )
 
+const (
+	TransferModeInstall  = "install"
+	TransferModeEvacuate = "evacuate"
+	TransferModeCleanup  = "cleanup"
+)
+
 // ─── Process Statuses ────────────────────────────────────────────────
 // pending → processing → completed | failed | cancelled
 // Must match VideoProcessStatus in vdohide-service (video-process.enum.ts).

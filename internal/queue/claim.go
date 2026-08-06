@@ -31,15 +31,40 @@ import (
 // Returns (nil, nil) when the queue is empty.
 func Claim(ctx context.Context, workerID string) (*models.VideoProcess, error) {
 	now := time.Now()
+	storage, err := models.StorageModel.FindByID(ctx, config.AppConfig.StorageId)
+	if err != nil {
+		return nil, err
+	}
+	assignments := []bson.M{}
+	if storage.Enable && storage.Status == enums.StorageStatusOnline {
+		assignments = append(assignments, bson.M{
+			"transferMode":    bson.M{"$in": []interface{}{enums.TransferModeInstall, nil}},
+			"targetStorageId": config.AppConfig.StorageId,
+		})
+	}
+	if storage.Status == enums.StorageStatusOnline &&
+		(storage.DrainState == enums.StorageDrainStateRequested ||
+			storage.DrainState == enums.StorageDrainStateDraining ||
+			storage.DrainState == enums.StorageDrainStateBlocked) {
+		assignments = append(assignments, bson.M{
+			"transferMode":    bson.M{"$in": []string{enums.TransferModeEvacuate, enums.TransferModeCleanup}},
+			"sourceStorageId": config.AppConfig.StorageId,
+		})
+	}
+	if len(assignments) == 0 {
+		return nil, nil
+	}
 	job, err := models.VideoProcessModel.FindOneAndUpdate(ctx,
 		bson.M{
-			"processType":     enums.ProcessTypeTransfer,
-			"status":          enums.ProcessStatusPending,
-			"targetStorageId": config.AppConfig.StorageId,
+			"processType": enums.ProcessTypeTransfer,
+			"status":      enums.ProcessStatusPending,
 			// งานที่รอ retry (backoff) ยังไม่ถึงเวลา — ข้ามไว้ก่อน
-			"$or": []bson.M{
-				{"nextRetryAt": bson.M{"$exists": false}},
-				{"nextRetryAt": bson.M{"$lte": now}},
+			"$and": []bson.M{
+				{"$or": assignments},
+				{"$or": []bson.M{
+					{"nextRetryAt": bson.M{"$exists": false}},
+					{"nextRetryAt": bson.M{"$lte": now}},
+				}},
 			},
 		},
 		bson.M{

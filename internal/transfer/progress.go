@@ -22,6 +22,11 @@ var stepPercent = map[string]float64{
 	"extract":  50,
 	"install":  75,
 	"media":    100,
+	"scan":     10,
+	"upload":   90,
+	"ingest":   100,
+	"verify":   25,
+	"cleanup":  100,
 }
 
 func startStep(ctx context.Context, processID, step string) {

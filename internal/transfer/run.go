@@ -48,7 +48,15 @@ type consumedAsset struct {
 
 // Run executes one claimed transfer job, then finalizes the per-process log.
 func Run(jobCtx context.Context, job *models.VideoProcess) error {
-	err := run(jobCtx, job)
+	var err error
+	switch job.TransferMode {
+	case enums.TransferModeEvacuate:
+		err = runEvacuate(jobCtx, job)
+	case enums.TransferModeCleanup:
+		err = runCleanup(jobCtx, job)
+	default:
+		err = run(jobCtx, job)
+	}
 	finalizeProcessLog(jobCtx, job, err)
 	return err
 }
@@ -56,6 +64,8 @@ func Run(jobCtx context.Context, job *models.VideoProcess) error {
 func run(ctx context.Context, job *models.VideoProcess) error {
 	fileID := derefStr(job.FileID)
 	slug := derefStr(job.Slug)
+	migrationID := derefStr(job.MigrationID)
+	isMigration := migrationID != ""
 	if fileID == "" {
 		return fmt.Errorf("job has no fileId")
 	}
@@ -64,7 +74,7 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 	storageID := config.AppConfig.StorageId
 
 	// storage ตัวเองใช้ไม่ได้ชั่วคราว (ปิด/เต็ม) — ไม่ใช่ความผิดของงาน คืนคิว
-	if reason := localStorageBlockReason(ctx); reason != "" {
+	if reason := installStorageBlockReason(ctx); reason != "" {
 		return fmt.Errorf("%s: %w", reason, queue.ErrJobRequeue)
 	}
 
@@ -122,11 +132,16 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 			return ctx.Err()
 		}
 		fileName := enums.ResolutionToFileName[res]
-		ingest := pendingIngestFor(ctx, fileID, fileName)
+		var ingest *models.Ingest
+		if isMigration {
+			ingest = pendingMigrationIngestFor(ctx, fileID, fileName, migrationID)
+		} else {
+			ingest = pendingIngestFor(ctx, fileID, fileName)
+		}
 		if ingest == nil {
 			continue // asset not produced yet (HLS still working) — partial transfer is fine
 		}
-		if hasVideoMedia(ctx, fileID, res) {
+		if !isMigration && hasVideoMedia(ctx, fileID, res) {
 			// media already exists (installed elsewhere) — stale ingest, clean up later
 			utils.LogMain("⏭️  [%s] %s media already exists — stale ingest", slug, res)
 			assets = append(assets, consumedAsset{ingest: ingest, resolution: res, fileName: fileName})
@@ -149,8 +164,14 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 	// sprite.zip (thumbnail track)
 	spriteZipPath := filepath.Join(workDir, enums.SpriteZipName)
 	hasSpriteZip := false
-	if spriteIngest := pendingIngestFor(ctx, fileID, enums.SpriteZipName); spriteIngest != nil {
-		if hasThumbnailMedia(ctx, fileID) {
+	var spriteIngest *models.Ingest
+	if isMigration {
+		spriteIngest = pendingMigrationIngestFor(ctx, fileID, enums.SpriteZipName, migrationID)
+	} else {
+		spriteIngest = pendingIngestFor(ctx, fileID, enums.SpriteZipName)
+	}
+	if spriteIngest != nil {
+		if !isMigration && hasThumbnailMedia(ctx, fileID) {
 			utils.LogMain("⏭️  [%s] thumbnail media already exists — stale sprite ingest", slug)
 			assets = append(assets, consumedAsset{ingest: spriteIngest, fileName: enums.SpriteZipName})
 		} else {
@@ -215,9 +236,29 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 	startStep(ctx, job.ID, "media")
 	now := time.Now()
 	mimeType := "video/mp4"
-	needCfPurge := false // resolution ใหม่ลง → playlist.m3u8 เปลี่ยน
+	needCfPurge := false
 
 	for _, res := range installedRes {
+		if isMigration {
+			var ingest *models.Ingest
+			for _, asset := range assets {
+				if asset.resolution == res {
+					ingest = asset.ingest
+					break
+				}
+			}
+			if ingest == nil {
+				return fmt.Errorf("migration ingest missing for %s", res)
+			}
+			if err := migrateMediaRecord(ctx, ingest, storageID, fileID, res, enums.MediaTypeVideo); err != nil {
+				return fmt.Errorf("migrate media %s: %w", res, err)
+			}
+			utils.LogMain("✅ [%s] Media moved: %s", slug, res)
+			if isPurgeResolution(res) {
+				needCfPurge = true
+			}
+			continue
+		}
 		if hasVideoMedia(ctx, fileID, res) {
 			continue
 		}
@@ -245,7 +286,15 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 		}
 	}
 
-	if hasSpriteZip && !hasThumbnailMedia(ctx, fileID) {
+	if hasSpriteZip && isMigration {
+		if spriteIngest == nil {
+			return fmt.Errorf("migration ingest missing for sprite")
+		}
+		if err := migrateMediaRecord(ctx, spriteIngest, storageID, fileID, "", enums.MediaTypeThumbnail); err != nil {
+			return fmt.Errorf("migrate thumbnail media: %w", err)
+		}
+		utils.LogMain("✅ [%s] Media moved: thumbnail", slug)
+	} else if hasSpriteZip && !hasThumbnailMedia(ctx, fileID) {
 		var totalSpriteSize int64
 		spriteDest := filepath.Join(storagePath, fileID, "sprite")
 		if entries, err := os.ReadDir(spriteDest); err == nil {
@@ -276,7 +325,13 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 	// LAST means a failed install retries with ingests intact — unlike the
 	// old worker, which deleted them right after download.)
 	for _, a := range assets {
-		softDeleteIngest(ctx, a.ingest.ID, slug, a.fileName)
+		if isMigration {
+			if err := markMigrationIngestInstalled(ctx, a.ingest.ID, slug, a.fileName); err != nil {
+				return err
+			}
+		} else {
+			softDeleteIngest(ctx, a.ingest.ID, slug, a.fileName)
+		}
 	}
 	completeStep(ctx, job.ID, "media")
 

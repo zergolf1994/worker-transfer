@@ -22,6 +22,19 @@ const (
 	IngestSourceTypeGDrive    = "gdrive"
 	IngestSourceTypeS3Import  = "s3_import"
 	IngestSourceTypeProcessed = "processed"
+	IngestSourceTypeMigration = "migration"
+)
+
+const (
+	IngestStatusUploading = "uploading"
+	IngestStatusCompleted = "completed"
+	IngestStatusFailed    = "failed"
+)
+
+const (
+	IngestMigrationStateStaged    = "staged"
+	IngestMigrationStateInstalled = "installed"
+	IngestMigrationStateCleaned   = "cleaned"
 )
 
 // ─── Resolution ──────────────────────────────────────────────────────

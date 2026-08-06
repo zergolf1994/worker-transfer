@@ -7,6 +7,14 @@ const (
 	StorageTypeS3    = "s3"
 )
 
+const (
+	StorageDrainStateIdle      = "idle"
+	StorageDrainStateRequested = "requested"
+	StorageDrainStateDraining  = "draining"
+	StorageDrainStateBlocked   = "blocked"
+	StorageDrainStateCompleted = "completed"
+)
+
 // ─── Storage Statuses ────────────────────────────────────────────────
 
 const (

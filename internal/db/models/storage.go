@@ -45,19 +45,24 @@ type StorageCapacity struct {
 // Storage represents a storage backend (local or S3).
 // Collection: "storages" | _id: String (UUID)
 type Storage struct {
-	ID          string              `bson:"_id" json:"id" goose:"required,default:uuid"`
-	Name        string              `bson:"name" json:"name" goose:"required"`
-	Enable      bool                `bson:"enable" json:"enable"`
-	Type        string              `bson:"type" json:"type"`                             // local, s3
-	Status      string              `bson:"status" json:"status" goose:"default:offline"` // online, offline, error, maintenance
-	Local       *StorageLocalConfig `bson:"local,omitempty" json:"local,omitempty"`
-	S3          *StorageS3Config    `bson:"s3,omitempty" json:"s3,omitempty"`
-	PublicURL   *string             `bson:"publicUrl,omitempty" json:"publicUrl,omitempty"`
-	Accepts     []string            `bson:"accepts" json:"accepts"` // upload, video, image, other
-	HeartbeatAt *time.Time          `bson:"heartbeatAt,omitempty" json:"heartbeatAt,omitempty"`
-	Capacity    *StorageCapacity    `bson:"capacity,omitempty" json:"capacity,omitempty"`
-	CreatedAt   time.Time           `bson:"createdAt" json:"createdAt" goose:"default:now"`
-	UpdatedAt   time.Time           `bson:"updatedAt" json:"updatedAt" goose:"default:now"`
+	ID                 string              `bson:"_id" json:"id" goose:"required,default:uuid"`
+	Name               string              `bson:"name" json:"name" goose:"required"`
+	Enable             bool                `bson:"enable" json:"enable"`
+	Type               string              `bson:"type" json:"type"`                             // local, s3
+	Status             string              `bson:"status" json:"status" goose:"default:offline"` // online, offline, error, maintenance
+	DrainState         string              `bson:"drainState" json:"drainState" goose:"default:idle"`
+	DrainTempStorageID *string             `bson:"drainTempStorageId,omitempty" json:"drainTempStorageId,omitempty"`
+	DrainRequestedAt   *time.Time          `bson:"drainRequestedAt,omitempty" json:"drainRequestedAt,omitempty"`
+	DrainCompletedAt   *time.Time          `bson:"drainCompletedAt,omitempty" json:"drainCompletedAt,omitempty"`
+	DrainError         *string             `bson:"drainError,omitempty" json:"drainError,omitempty"`
+	Local              *StorageLocalConfig `bson:"local,omitempty" json:"local,omitempty"`
+	S3                 *StorageS3Config    `bson:"s3,omitempty" json:"s3,omitempty"`
+	PublicURL          *string             `bson:"publicUrl,omitempty" json:"publicUrl,omitempty"`
+	Accepts            []string            `bson:"accepts" json:"accepts"` // upload, video, image, other
+	HeartbeatAt        *time.Time          `bson:"heartbeatAt,omitempty" json:"heartbeatAt,omitempty"`
+	Capacity           *StorageCapacity    `bson:"capacity,omitempty" json:"capacity,omitempty"`
+	CreatedAt          time.Time           `bson:"createdAt" json:"createdAt" goose:"default:now"`
+	UpdatedAt          time.Time           `bson:"updatedAt" json:"updatedAt" goose:"default:now"`
 }
 
 // StorageModel is the goose model for the "storages" collection.

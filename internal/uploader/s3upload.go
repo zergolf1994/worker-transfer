@@ -77,6 +77,54 @@ func UploadToS3(ctx context.Context, storage *models.Storage, localPath, objectK
 	return uploadMultipart(ctx, client, s3Cfg.Bucket, fullKey, localPath, totalSize, onProgress)
 }
 
+// VerifyS3Object checks that an uploaded object exists and has the expected size.
+func VerifyS3Object(ctx context.Context, storage *models.Storage, objectKey string, expectedSize int64) error {
+	if storage.S3 == nil || storage.S3.Endpoint == nil {
+		return fmt.Errorf("storage has no S3 config")
+	}
+	s3Cfg := storage.S3
+	endpoint := strings.TrimRight(*s3Cfg.Endpoint, "/")
+	if !strings.HasPrefix(endpoint, "http") {
+		endpoint = "https://" + endpoint
+	}
+	if strings.HasSuffix(endpoint, "/"+s3Cfg.Bucket) {
+		endpoint = endpoint[:len(endpoint)-len(s3Cfg.Bucket)-1]
+	}
+	fullKey := objectKey
+	if s3Cfg.Prefix != "" && !strings.HasPrefix(objectKey, s3Cfg.Prefix) {
+		fullKey = strings.TrimRight(s3Cfg.Prefix, "/") + "/" + objectKey
+	}
+	region := s3Cfg.Region
+	if region == "" {
+		region = "auto"
+	}
+	client := s3.New(s3.Options{
+		Region:       region,
+		BaseEndpoint: &endpoint,
+		Credentials: credentials.NewStaticCredentialsProvider(
+			s3Cfg.AccessKeyID,
+			s3Cfg.SecretAccessKey,
+			"",
+		),
+		UsePathStyle: s3Cfg.ForcePathStyle,
+	})
+	result, err := client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(s3Cfg.Bucket),
+		Key:    aws.String(fullKey),
+	})
+	if err != nil {
+		return fmt.Errorf("S3 HeadObject: %w", err)
+	}
+	if result.ContentLength == nil || *result.ContentLength != expectedSize {
+		actual := int64(-1)
+		if result.ContentLength != nil {
+			actual = *result.ContentLength
+		}
+		return fmt.Errorf("S3 size mismatch: expected %d, got %d", expectedSize, actual)
+	}
+	return nil
+}
+
 // uploadSinglePart uploads a file in a single PutObject call.
 func uploadSinglePart(ctx context.Context, client *s3.Client, bucket, key, localPath string, totalSize int64, onProgress func(uploaded, total int64)) error {
 	f, err := os.Open(localPath)
