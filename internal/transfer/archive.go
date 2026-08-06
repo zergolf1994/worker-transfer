@@ -68,43 +68,44 @@ func zipDir(ctx context.Context, sourceDir, zipPath string) error {
 		_ = out.Close()
 		return err
 	}
-	err = filepath.Walk(sourceDir, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
+	entries, err := os.ReadDir(sourceDir)
+	if err != nil {
+		return closeWithError(err)
+	}
+	for _, entry := range entries {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return closeWithError(ctx.Err())
 		}
-		if info.IsDir() {
-			return nil
+		if entry.IsDir() {
+			continue
 		}
-		rel, err := filepath.Rel(sourceDir, path)
+		path := filepath.Join(sourceDir, entry.Name())
+		info, err := entry.Info()
 		if err != nil {
-			return err
+			return closeWithError(err)
 		}
 		header, err := zip.FileInfoHeader(info)
 		if err != nil {
-			return err
+			return closeWithError(err)
 		}
-		header.Name = filepath.ToSlash(rel)
+		header.Name = entry.Name()
 		header.Method = zip.Deflate
 		writer, err := zw.CreateHeader(header)
 		if err != nil {
-			return err
+			return closeWithError(err)
 		}
 		in, err := os.Open(path)
 		if err != nil {
-			return err
+			return closeWithError(err)
 		}
 		_, copyErr := io.Copy(writer, in)
 		closeErr := in.Close()
 		if copyErr != nil {
-			return copyErr
+			return closeWithError(copyErr)
 		}
-		return closeErr
-	})
-	if err != nil {
-		return closeWithError(err)
+		if closeErr != nil {
+			return closeWithError(closeErr)
+		}
 	}
 	if err := zw.Close(); err != nil {
 		_ = out.Close()

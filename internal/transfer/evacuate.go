@@ -126,7 +126,7 @@ func runEvacuate(ctx context.Context, job *models.VideoProcess) error {
 		if err != nil || info.IsDir() {
 			return fmt.Errorf("source asset missing %s: %w", asset.sourcePath, err)
 		}
-		objectKey := fmt.Sprintf("migration/%s/%s/%s", migrationID, asset.media.ID, asset.fileName)
+		objectKey := fmt.Sprintf("migration/%s/%s", fileID, asset.fileName)
 		if err := uploader.VerifyS3Object(ctx, tempStorage, objectKey, info.Size()); err != nil {
 			utils.LogMain("📤 [%s] Uploading %s...", slug, asset.fileName)
 			if err := uploader.UploadToS3(ctx, tempStorage, asset.localPath, objectKey, pctLogger64(slug, asset.fileName)); err != nil {
