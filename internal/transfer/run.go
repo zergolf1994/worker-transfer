@@ -195,10 +195,8 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 			if err := finalizeMigrationIngests(ctx, fileID, migrationID, sourceStorageID); err != nil {
 				return fmt.Errorf("finalize migrated ingest: %w", err)
 			}
-			slugs := collectSlugs(ctx, fileID, slug)
-			cache.Del(ctx, redisKeysFor(slugs)...)
-			if err := purgePlaylistCache(ctx, slug, slugs, false); err != nil {
-				return fmt.Errorf("purge migrated playlist cache: %w", err)
+			if err := invalidateMigrationCache(ctx, fileID, slug, migrationID); err != nil {
+				return err
 			}
 		}
 		// enqueuer queued a file with nothing pending — treat as done, not failed
@@ -348,16 +346,16 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 	// Redis: ลบ playlist_master/playlist_json/embed_resolve ทุกครั้งที่มี
 	//   media ใหม่ (รวม sprite — embed/feed เปลี่ยน) | ไม่ตั้ง REDIS_URL = no-op
 	// Cloudflare: purge playlist.m3u8 after media creation/cutover so cached
-	// playlists immediately pick up the new media slugs —
-	//   ไม่ได้ผูก domain_bindings.playlist = ข้าม
-	if len(installedRes) > 0 || hasSpriteZip {
+	// playlists immediately pick up the new media slugs. Migration requires
+	// a configured playlist profile; regular ingest remains best-effort.
+	if isMigration {
+		if err := invalidateMigrationCache(ctx, fileID, slug, migrationID); err != nil {
+			return err
+		}
+	} else if len(installedRes) > 0 || hasSpriteZip {
 		slugs := collectSlugs(ctx, fileID, slug)
 		cache.Del(ctx, redisKeysFor(slugs)...)
-		if isMigration {
-			if err := purgePlaylistCache(ctx, slug, slugs, false); err != nil {
-				return fmt.Errorf("purge migrated playlist cache: %w", err)
-			}
-		} else if needCfPurge {
+		if needCfPurge {
 			_ = purgePlaylistCache(ctx, slug, slugs, false)
 		}
 	}
@@ -376,6 +374,19 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 
 	success = true
 	utils.LogMain("✅ [%s] TRANSFER COMPLETE (%d video(s), sprite=%v)", slug, len(installedRes), hasSpriteZip)
+	return nil
+}
+
+func invalidateMigrationCache(ctx context.Context, fileID, slug, migrationID string) error {
+	slugs := collectSlugs(ctx, fileID, slug)
+	if len(slugs) == 0 {
+		return fmt.Errorf("migration %s has no file slug for cache invalidation", migrationID)
+	}
+	cache.Del(ctx, redisKeysFor(slugs)...)
+	if err := purgePlaylistCache(ctx, slug, slugs, false); err != nil {
+		return fmt.Errorf("purge migration %s playlist cache: %w", migrationID, err)
+	}
+	utils.LogMain("☁️  [%s] Migration cache invalidated (%d playlist(s))", slug, len(slugs))
 	return nil
 }
 

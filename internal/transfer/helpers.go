@@ -483,9 +483,8 @@ func asBsonM(v interface{}) (bson.M, bool) {
 	}
 }
 
-// purgePlaylistCache always purges playlist.m3u8. Migration cutovers also
-// purge video.m3u8 because the media storage backing the rendition changed.
-// ไม่ได้ผูก CF profile (domain_bindings.playlist) → ข้ามเงียบๆ
+// purgePlaylistCache always purges playlist.m3u8. Missing domain/profile
+// configuration is an error so required migration invalidation can retry.
 func purgePlaylistCache(
 	ctx context.Context,
 	slug string,
@@ -495,12 +494,12 @@ func purgePlaylistCache(
 	domainSetting, err := models.SettingModel.FindOne(ctx, bson.M{"name": enums.SettingDomainPlaylist})
 	if err != nil {
 		log.Printf("⚠️  [%s] Cloudflare purge skipped: domain_playlist is unavailable", slug)
-		return nil
+		return fmt.Errorf("domain_playlist is unavailable: %w", err)
 	}
 	domain := domainSetting.GetString("")
 	if domain == "" {
 		log.Printf("⚠️  [%s] Cloudflare purge skipped: domain_playlist is empty", slug)
-		return nil
+		return fmt.Errorf("domain_playlist is empty")
 	}
 	if !strings.HasPrefix(domain, "http://") && !strings.HasPrefix(domain, "https://") {
 		domain = "https://" + domain
@@ -510,8 +509,7 @@ func purgePlaylistCache(
 	cfConfig := resolveCfProfile(ctx, "playlist")
 	if cfConfig.ZoneID == "" || cfConfig.APIToken == "" {
 		log.Printf("⚠️  [%s] Cloudflare purge skipped: playlist profile is not configured", slug)
-		// ไม่ได้ผูก CF profile — ข้ามเงียบๆ (ตั้งใจ ไม่ใช่ error)
-		return nil
+		return fmt.Errorf("playlist Cloudflare profile is not configured")
 	}
 
 	urlsPerSlug := 1
