@@ -7,7 +7,10 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
+	"worker-transfer/internal/config"
 	"worker-transfer/internal/db/models"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -22,6 +25,13 @@ const (
 	// partSize is the size of each part in multipart upload.
 	partSize = 50 * 1024 * 1024 // 50 MB
 )
+
+type multipartClient interface {
+	CreateMultipartUpload(context.Context, *s3.CreateMultipartUploadInput, ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error)
+	UploadPart(context.Context, *s3.UploadPartInput, ...func(*s3.Options)) (*s3.UploadPartOutput, error)
+	CompleteMultipartUpload(context.Context, *s3.CompleteMultipartUploadInput, ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error)
+	AbortMultipartUpload(context.Context, *s3.AbortMultipartUploadInput, ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error)
+}
 
 // UploadToS3 uploads a local file to S3-compatible storage.
 // objectKey is the full key (e.g. "{fileID}/file_original.mp4").
@@ -74,7 +84,8 @@ func UploadToS3(ctx context.Context, storage *models.Storage, localPath, objectK
 	if totalSize <= multipartThreshold {
 		return uploadSinglePart(ctx, client, s3Cfg.Bucket, fullKey, localPath, totalSize, onProgress)
 	}
-	return uploadMultipart(ctx, client, s3Cfg.Bucket, fullKey, localPath, totalSize, onProgress)
+	return uploadMultipart(ctx, client, s3Cfg.Bucket, fullKey, localPath, totalSize,
+		partSize, config.AppConfig.S3UploadConcurrency, onProgress)
 }
 
 // VerifyS3Object checks that an uploaded object exists and has the expected size.
@@ -151,87 +162,143 @@ func uploadSinglePart(ctx context.Context, client *s3.Client, bucket, key, local
 	return nil
 }
 
-// uploadMultipart uploads a file using S3 multipart upload.
-func uploadMultipart(ctx context.Context, client *s3.Client, bucket, key, localPath string, totalSize int64, onProgress func(uploaded, total int64)) error {
+// uploadMultipart uploads independent file sections concurrently. A
+// concurrency of 1 preserves the previous sequential behavior.
+func uploadMultipart(
+	ctx context.Context,
+	client multipartClient,
+	bucket, key, localPath string,
+	totalSize int64,
+	partBytes int64,
+	concurrency int,
+	onProgress func(uploaded, total int64),
+) error {
 	f, err := os.Open(localPath)
 	if err != nil {
 		return fmt.Errorf("open file: %w", err)
 	}
 	defer f.Close()
 
-	// Initiate multipart upload
 	createResp, err := client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
-		Bucket:      aws.String(bucket),
-		Key:         aws.String(key),
-		ContentType: aws.String("video/mp4"),
+		Bucket: aws.String(bucket), Key: aws.String(key), ContentType: aws.String("video/mp4"),
 	})
 	if err != nil {
 		return fmt.Errorf("S3 CreateMultipartUpload: %w", err)
 	}
+	if createResp.UploadId == nil || *createResp.UploadId == "" {
+		return fmt.Errorf("S3 CreateMultipartUpload returned no upload ID")
+	}
 	uploadID := *createResp.UploadId
-
-	// Upload parts
-	var completedParts []types.CompletedPart
-	var uploaded int64
-	partNum := int32(1)
-	buf := make([]byte, partSize)
-
-	for {
-		n, readErr := io.ReadFull(f, buf)
-		if n == 0 && readErr != nil {
-			break
-		}
-
-		partResp, err := client.UploadPart(ctx, &s3.UploadPartInput{
-			Bucket:        aws.String(bucket),
-			Key:           aws.String(key),
-			UploadId:      aws.String(uploadID),
-			PartNumber:    aws.Int32(partNum),
-			Body:          strings.NewReader(string(buf[:n])),
-			ContentLength: aws.Int64(int64(n)),
-		})
-		if err != nil {
-			// Abort on failure
-			client.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
-				Bucket:   aws.String(bucket),
-				Key:      aws.String(key),
-				UploadId: aws.String(uploadID),
-			})
-			return fmt.Errorf("S3 UploadPart %d: %w", partNum, err)
-		}
-
-		completedParts = append(completedParts, types.CompletedPart{
-			ETag:       partResp.ETag,
-			PartNumber: aws.Int32(partNum),
-		})
-
-		uploaded += int64(n)
-		if onProgress != nil {
-			onProgress(uploaded, totalSize)
-		}
-		log.Printf("📤 S3 part %d: %.2f / %.2f MB (%.1f%%)",
-			partNum, float64(uploaded)/1024/1024, float64(totalSize)/1024/1024,
-			float64(uploaded)/float64(totalSize)*100)
-
-		partNum++
-		if readErr != nil {
-			break // EOF or short read (last part)
+	abort := func() {
+		abortCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if _, abortErr := client.AbortMultipartUpload(abortCtx, &s3.AbortMultipartUploadInput{
+			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: aws.String(uploadID),
+		}); abortErr != nil {
+			log.Printf("⚠️  S3 abort multipart failed: %v", abortErr)
 		}
 	}
 
-	// Complete multipart upload
+	type partJob struct {
+		index  int
+		number int32
+		offset int64
+		size   int64
+	}
+	if partBytes <= 0 {
+		abort()
+		return fmt.Errorf("multipart part size must be positive")
+	}
+	partCount := int((totalSize + partBytes - 1) / partBytes)
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if concurrency > partCount {
+		concurrency = partCount
+	}
+	jobs := make(chan partJob, partCount)
+	for index := 0; index < partCount; index++ {
+		offset := int64(index) * partBytes
+		size := partBytes
+		if remaining := totalSize - offset; remaining < size {
+			size = remaining
+		}
+		jobs <- partJob{index: index, number: int32(index + 1), offset: offset, size: size}
+	}
+	close(jobs)
+
+	uploadCtx, cancelUploads := context.WithCancel(ctx)
+	defer cancelUploads()
+	completedParts := make([]types.CompletedPart, partCount)
+	var uploaded int64
+	var progressMu sync.Mutex
+	var firstErr error
+	var errOnce sync.Once
+	var workers sync.WaitGroup
+
+	log.Printf("📤 S3 multipart: %d part(s), %.0f MB each, concurrency=%d",
+		partCount, float64(partBytes)/1024/1024, concurrency)
+	for range concurrency {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for part := range jobs {
+				if uploadCtx.Err() != nil {
+					return
+				}
+				startedAt := time.Now()
+				body := io.NewSectionReader(f, part.offset, part.size)
+				partResp, uploadErr := client.UploadPart(uploadCtx, &s3.UploadPartInput{
+					Bucket: aws.String(bucket), Key: aws.String(key), UploadId: aws.String(uploadID),
+					PartNumber: aws.Int32(part.number), Body: body, ContentLength: aws.Int64(part.size),
+				})
+				if uploadErr != nil {
+					errOnce.Do(func() {
+						firstErr = fmt.Errorf("S3 UploadPart %d: %w", part.number, uploadErr)
+						cancelUploads()
+					})
+					return
+				}
+
+				completedParts[part.index] = types.CompletedPart{
+					ETag: partResp.ETag, PartNumber: aws.Int32(part.number),
+				}
+				duration := time.Since(startedAt)
+				progressMu.Lock()
+				uploaded += part.size
+				if onProgress != nil {
+					onProgress(uploaded, totalSize)
+				}
+				progressMu.Unlock()
+				seconds := duration.Seconds()
+				if seconds < 0.001 {
+					seconds = 0.001
+				}
+				log.Printf("📤 S3 part %d/%d: %.2f MB in %.2fs (%.2f MB/s)",
+					part.number, partCount, float64(part.size)/1024/1024, seconds,
+					float64(part.size)/1024/1024/seconds)
+			}
+		}()
+	}
+	workers.Wait()
+	if firstErr != nil {
+		abort()
+		return firstErr
+	}
+	if err := ctx.Err(); err != nil {
+		abort()
+		return err
+	}
+
 	_, err = client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
-		Bucket:   aws.String(bucket),
-		Key:      aws.String(key),
-		UploadId: aws.String(uploadID),
-		MultipartUpload: &types.CompletedMultipartUpload{
-			Parts: completedParts,
-		},
+		Bucket: aws.String(bucket), Key: aws.String(key), UploadId: aws.String(uploadID),
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: completedParts},
 	})
 	if err != nil {
+		abort()
 		return fmt.Errorf("S3 CompleteMultipartUpload: %w", err)
 	}
 
-	log.Printf("✅ S3 multipart upload complete: %d parts, %.2f MB", partNum-1, float64(totalSize)/1024/1024)
+	log.Printf("✅ S3 multipart upload complete: %d parts, %.2f MB", partCount, float64(totalSize)/1024/1024)
 	return nil
 }

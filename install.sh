@@ -18,6 +18,7 @@ DATABASE_URL=""
 STORAGE_ID=""
 STORAGE_PATH="/home/files"
 REDIS_URL=""
+S3_UPLOAD_CONCURRENCY=3
 
 APP_NAME="worker-transfer"
 APP_DIR="/opt/$APP_NAME"
@@ -37,6 +38,7 @@ while [[ $# -gt 0 ]]; do
         --database-url)      DATABASE_URL="$2"; shift 2 ;;
         --mongodb-uri)       DATABASE_URL="$2"; shift 2 ;; # alias เดิม
         --redis-url)         REDIS_URL="$2"; shift 2 ;;
+        --s3-upload-concurrency) S3_UPLOAD_CONCURRENCY="$2"; shift 2 ;;
         --storage-id)        STORAGE_ID="$2"; shift 2 ;;
         --storage-path)      STORAGE_PATH="$2"; shift 2 ;;
         -h|--help)
@@ -52,6 +54,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --storage-id ID      Local storage ID (REQUIRED — storage ที่เครื่องนี้ดูแล)"
             echo "  --storage-path DIR   Local storage path (default: /home/files)"
             echo "  --redis-url URL      Redis URL (optional — ลบแคช content/player หลังติดตั้ง media)"
+            echo "  --s3-upload-concurrency NUM  Parallel multipart uploads (default: 3, range: 1-8)"
             echo "  -h, --help           Show this help"
             echo ""
             echo "Examples:"
@@ -155,6 +158,7 @@ DATABASE_URL=$DATABASE_URL
 STORAGE_ID=$STORAGE_ID
 STORAGE_PATH=$STORAGE_PATH
 REDIS_URL=$REDIS_URL
+S3_UPLOAD_CONCURRENCY=$S3_UPLOAD_CONCURRENCY
 EOF
 
 # ─── Systemd service template ─────────────────────────────────

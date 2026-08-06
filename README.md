@@ -77,6 +77,13 @@ WORKER_ID=transfer_myhost@1
 
 # Optional — log file (default: logs/worker-transfer.log)
 LOG_PATH=logs/worker-transfer.log
+
+# Optional — Redis cache invalidation
+REDIS_URL=redis://localhost:6379/0
+
+# Optional — parallel parts for files over 100 MB (default: 3, range: 1-8)
+# Set to 1 to restore sequential multipart uploads.
+S3_UPLOAD_CONCURRENCY=3
 ```
 
 > ⚠ `STORAGE_ID` + `STORAGE_PATH` บังคับ — ไม่ตั้ง binary จะ exit ทันที
