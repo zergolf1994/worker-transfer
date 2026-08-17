@@ -277,6 +277,73 @@ func cutoverMigrationMedia(
 	})
 }
 
+// cutoverDirectMigrationMedia switches one media (and its cloned references)
+// from local storage to a permanent S3 destination. No ingest is created:
+// the uploaded objects are final media objects, not service-owned Temp files.
+func cutoverDirectMigrationMedia(
+	ctx context.Context,
+	sourceMediaID, sourceStorageID, targetStorageID, fileID, resolution, mediaType string,
+) error {
+	return goose.WithTransaction(ctx, func(sc mongo.SessionContext) (interface{}, error) {
+		source, err := models.MediaModel.FindOne(sc, bson.M{
+			"_id": sourceMediaID, "fileId": fileID, "storageId": sourceStorageID,
+			"deletedAt": bson.M{"$exists": false},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("source media %s was changed or removed: %w", sourceMediaID, err)
+		}
+
+		cloneFilter := bson.M{
+			"clonedFrom": fileID, "type": mediaType, "storageId": sourceStorageID,
+			"deletedAt": bson.M{"$exists": false},
+		}
+		if resolution != "" {
+			cloneFilter["resolution"] = resolution
+		}
+		cursor, err := models.MediaModel.FindRaw(sc, cloneFilter)
+		if err != nil {
+			return nil, fmt.Errorf("load cloned source media: %w", err)
+		}
+		defer cursor.Close(sc)
+
+		oldMedias := []models.Media{*source}
+		for cursor.Next(sc) {
+			var clone models.Media
+			if err := cursor.Decode(&clone); err != nil {
+				return nil, fmt.Errorf("decode cloned source media: %w", err)
+			}
+			oldMedias = append(oldMedias, clone)
+		}
+		if err := cursor.Err(); err != nil {
+			return nil, fmt.Errorf("scan cloned source media: %w", err)
+		}
+
+		now := time.Now()
+		oldIDs := make([]string, 0, len(oldMedias))
+		for _, oldMedia := range oldMedias {
+			newMedia := oldMedia
+			newMedia.ID = newUUID()
+			newMedia.Slug = utils.RandomString(11, false)
+			newMedia.StorageID = &targetStorageID
+			newMedia.Prewarm = nil
+			newMedia.DeletedAt = nil
+			newMedia.CreatedAt = now
+			newMedia.UpdatedAt = now
+			if _, err := models.MediaModel.Create(sc, &newMedia); err != nil {
+				return nil, fmt.Errorf("create direct-migrated media for %s: %w", oldMedia.ID, err)
+			}
+			oldIDs = append(oldIDs, oldMedia.ID)
+		}
+		if _, err := models.MediaModel.UpdateMany(sc, bson.M{
+			"_id": bson.M{"$in": oldIDs}, "storageId": sourceStorageID,
+			"deletedAt": bson.M{"$exists": false},
+		}, bson.M{"$set": bson.M{"deletedAt": now, "updatedAt": now}}); err != nil {
+			return nil, fmt.Errorf("soft-delete direct migration source media: %w", err)
+		}
+		return nil, nil
+	})
+}
+
 // ─── Clone propagation ───────────────────────────────────────
 
 func cloneMediaToClonedFiles(ctx context.Context, sourceFileID string, media models.Media, slug string) {

@@ -35,24 +35,34 @@ func runEvacuate(ctx context.Context, job *models.VideoProcess) error {
 	fileID := derefStr(job.FileID)
 	migrationID := derefStr(job.MigrationID)
 	tempStorageID := derefStr(job.TempStorageID)
+	destinationStorageID := derefStr(job.DestinationStorageID)
 	sourceStorageID := derefStr(job.SourceStorageID)
-	if fileID == "" || migrationID == "" || tempStorageID == "" || sourceStorageID == "" {
+	if fileID == "" || migrationID == "" || (tempStorageID == "" && destinationStorageID == "") || sourceStorageID == "" {
 		return fmt.Errorf("evacuate job is missing migration routing fields")
 	}
 	if sourceStorageID != config.AppConfig.StorageId {
 		return fmt.Errorf("evacuate source storage does not match this worker")
 	}
 
-	tempStorage, err := models.StorageModel.FindByID(ctx, tempStorageID)
-	if err != nil || tempStorage.Type != enums.StorageTypeS3 || !tempStorage.IsOnline() {
-		return fmt.Errorf("temp storage %s unavailable", tempStorageID)
+	directToPermanentS3 := destinationStorageID != ""
+	uploadStorageID := tempStorageID
+	if directToPermanentS3 {
+		uploadStorageID = destinationStorageID
+	}
+	uploadStorage, err := models.StorageModel.FindByID(ctx, uploadStorageID)
+	if err != nil || uploadStorage.Type != enums.StorageTypeS3 || !uploadStorage.IsOnline() {
+		return fmt.Errorf("S3 upload storage %s unavailable", uploadStorageID)
 	}
 
 	slug := derefStr(job.Slug)
 	if slug == "" {
 		slug = fileID
 	}
-	utils.LogMain("📤 [%s] START EVACUATE (%s → S3 temp)", slug, sourceStorageID)
+	destinationLabel := "S3 temp"
+	if directToPermanentS3 {
+		destinationLabel = "permanent S3"
+	}
+	utils.LogMain("📤 [%s] START EVACUATE (%s → %s)", slug, sourceStorageID, destinationLabel)
 	startStep(ctx, job.ID, "scan")
 
 	workDir := transferWorkDir(slug, job.ID)
@@ -96,14 +106,21 @@ func runEvacuate(ctx context.Context, job *models.VideoProcess) error {
 			})
 		case enums.MediaTypeThumbnail:
 			sourceDir := filepath.Join(config.AppConfig.StoragePath, fileID, "sprite")
-			zipPath := filepath.Join(workDir, media.ID+"-sprite.zip")
-			if err := zipDir(ctx, sourceDir, zipPath); err != nil {
-				return fmt.Errorf("archive sprite for media %s: %w", media.ID, err)
+			if directToPermanentS3 {
+				assets = append(assets, evacuationAsset{
+					media: media, localPath: sourceDir, fileName: enums.SpriteVTTName,
+					sourcePath: filepath.Join(fileID, "sprite"), mimeType: "text/vtt",
+				})
+			} else {
+				zipPath := filepath.Join(workDir, media.ID+"-sprite.zip")
+				if err := zipDir(ctx, sourceDir, zipPath); err != nil {
+					return fmt.Errorf("archive sprite for media %s: %w", media.ID, err)
+				}
+				assets = append(assets, evacuationAsset{
+					media: media, localPath: zipPath, fileName: enums.SpriteZipName,
+					sourcePath: filepath.Join(fileID, "sprite"), mimeType: "application/zip", temporary: true,
+				})
 			}
-			assets = append(assets, evacuationAsset{
-				media: media, localPath: zipPath, fileName: enums.SpriteZipName,
-				sourcePath: filepath.Join(fileID, "sprite"), mimeType: "application/zip", temporary: true,
-			})
 		default:
 			return fmt.Errorf("media %s type %s is not supported by transfer migration", media.ID, media.Type)
 		}
@@ -112,6 +129,20 @@ func runEvacuate(ctx context.Context, job *models.VideoProcess) error {
 		return fmt.Errorf("scan source media: %w", err)
 	}
 	if len(assets) == 0 {
+		if directToPermanentS3 {
+			cutOverCount, _ := models.MediaModel.CountDocuments(ctx, bson.M{
+				"_id": bson.M{"$in": job.SourceMediaIDs}, "storageId": sourceStorageID,
+				"deletedAt": bson.M{"$exists": true, "$ne": nil},
+			})
+			if cutOverCount == int64(len(job.SourceMediaIDs)) {
+				if err := invalidateMigrationCache(ctx, fileID, slug, migrationID); err != nil {
+					return err
+				}
+				utils.LogMain("✅ [%s] Direct migration already cut over; cache invalidated", slug)
+				success = true
+				return nil
+			}
+		}
 		return fmt.Errorf("no active source media found")
 	}
 	completeStep(ctx, job.ID, "scan")
@@ -122,16 +153,48 @@ func runEvacuate(ctx context.Context, job *models.VideoProcess) error {
 			return ctx.Err()
 		}
 		info, err := os.Stat(asset.localPath)
-		if err != nil || info.IsDir() {
+		if err != nil {
 			return fmt.Errorf("source asset missing %s: %w", asset.sourcePath, err)
 		}
+		if directToPermanentS3 && asset.media.Type == enums.MediaTypeThumbnail {
+			if !info.IsDir() {
+				return fmt.Errorf("sprite source is not a directory: %s", asset.sourcePath)
+			}
+			if err := uploadDirectoryToS3(ctx, uploadStorage, asset.localPath, filepath.ToSlash(filepath.Join(fileID, "sprite")), slug); err != nil {
+				return fmt.Errorf("upload sprite: %w", err)
+			}
+		} else if info.IsDir() {
+			return fmt.Errorf("source asset is a directory: %s", asset.sourcePath)
+		}
+
+		if directToPermanentS3 {
+			if asset.media.Type == enums.MediaTypeVideo {
+				objectKey := filepath.ToSlash(filepath.Join(fileID, asset.fileName))
+				if err := uploader.VerifyS3Object(ctx, uploadStorage, objectKey, info.Size()); err != nil {
+					utils.LogMain("📤 [%s] Uploading %s...", slug, asset.fileName)
+					if err := uploader.UploadToS3(ctx, uploadStorage, asset.localPath, objectKey, pctLogger64(slug, asset.fileName)); err != nil {
+						return fmt.Errorf("upload %s: %w", asset.fileName, err)
+					}
+					if err := uploader.VerifyS3Object(ctx, uploadStorage, objectKey, info.Size()); err != nil {
+						return fmt.Errorf("verify %s: %w", asset.fileName, err)
+					}
+				}
+			}
+			resolution := derefStr(asset.media.Resolution)
+			if err := cutoverDirectMigrationMedia(ctx, asset.media.ID, sourceStorageID, destinationStorageID, fileID, resolution, asset.media.Type); err != nil {
+				return fmt.Errorf("cut over %s: %w", asset.media.ID, err)
+			}
+			utils.LogMain("✅ [%s] Media moved directly: %s", slug, asset.fileName)
+			continue
+		}
+
 		objectKey := fmt.Sprintf("migration/%s/%s", fileID, asset.fileName)
-		if err := uploader.VerifyS3Object(ctx, tempStorage, objectKey, info.Size()); err != nil {
+		if err := uploader.VerifyS3Object(ctx, uploadStorage, objectKey, info.Size()); err != nil {
 			utils.LogMain("📤 [%s] Uploading %s...", slug, asset.fileName)
-			if err := uploader.UploadToS3(ctx, tempStorage, asset.localPath, objectKey, pctLogger64(slug, asset.fileName)); err != nil {
+			if err := uploader.UploadToS3(ctx, uploadStorage, asset.localPath, objectKey, pctLogger64(slug, asset.fileName)); err != nil {
 				return fmt.Errorf("upload %s: %w", asset.fileName, err)
 			}
-			if err := uploader.VerifyS3Object(ctx, tempStorage, objectKey, info.Size()); err != nil {
+			if err := uploader.VerifyS3Object(ctx, uploadStorage, objectKey, info.Size()); err != nil {
 				return fmt.Errorf("verify %s: %w", asset.fileName, err)
 			}
 		}
@@ -145,7 +208,7 @@ func runEvacuate(ctx context.Context, job *models.VideoProcess) error {
 			},
 			bson.M{
 				"$set": bson.M{
-					"fileId": fileID, "storageId": tempStorageID, "fileName": asset.fileName,
+					"fileId": fileID, "storageId": uploadStorageID, "fileName": asset.fileName,
 					"status": enums.IngestStatusCompleted, "size": info.Size(), "mimeType": asset.mimeType,
 					"path": objectKey, "sourceType": enums.IngestSourceTypeMigration,
 					"migrationState": enums.IngestMigrationStateStaged,
@@ -162,8 +225,17 @@ func runEvacuate(ctx context.Context, job *models.VideoProcess) error {
 	}
 	completeStep(ctx, job.ID, "upload")
 	startStep(ctx, job.ID, "ingest")
+	if directToPermanentS3 {
+		if err := invalidateMigrationCache(ctx, fileID, slug, migrationID); err != nil {
+			return err
+		}
+	}
 	completeStep(ctx, job.ID, "ingest")
-	utils.LogMain("✅ [%s] EVACUATE STAGED (%d asset(s))", slug, len(assets))
+	if directToPermanentS3 {
+		utils.LogMain("✅ [%s] EVACUATE COMPLETE (%d asset(s))", slug, len(assets))
+	} else {
+		utils.LogMain("✅ [%s] EVACUATE STAGED (%d asset(s))", slug, len(assets))
+	}
 	success = true
 	return nil
 }

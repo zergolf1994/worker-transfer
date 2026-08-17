@@ -5,6 +5,7 @@ import (
 	goerrors "errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"worker-transfer/internal/db/models"
 	"worker-transfer/internal/downloader"
 	"worker-transfer/internal/queue"
+	"worker-transfer/internal/uploader"
 
 	"go.mongodb.org/mongo-driver/bson"
 )
@@ -74,11 +76,28 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 	}
 
 	storagePath := config.AppConfig.StoragePath
-	storageID := config.AppConfig.StorageId
+	storageID := derefStr(job.DestinationStorageID)
+	if storageID == "" {
+		storageID = config.AppConfig.StorageId
+	}
+	targetStorage, err := models.StorageModel.FindByID(ctx, storageID)
+	if err != nil {
+		return fmt.Errorf("target storage %s not found: %w", storageID, err)
+	}
+	isS3Target := targetStorage.Type == enums.StorageTypeS3
 
-	// storage ตัวเองใช้ไม่ได้ชั่วคราว (ปิด/เต็ม) — ไม่ใช่ความผิดของงาน คืนคิว
-	if reason := installStorageBlockReason(ctx); reason != "" {
-		return fmt.Errorf("%s: %w", reason, queue.ErrJobRequeue)
+	if isS3Target {
+		if !targetStorage.IsOnline() || targetStorage.S3 == nil {
+			return fmt.Errorf("S3 target storage %s unavailable: %w", storageID, queue.ErrJobRequeue)
+		}
+	} else {
+		// local install ต้องลง storage ของ worker เครื่องนี้เท่านั้น
+		if storageID != config.AppConfig.StorageId {
+			return fmt.Errorf("local target storage does not match this worker")
+		}
+		if reason := installStorageBlockReason(ctx); reason != "" {
+			return fmt.Errorf("%s: %w", reason, queue.ErrJobRequeue)
+		}
 	}
 
 	procLogger := utils.NewProcessLogger(slug)
@@ -98,7 +117,7 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 		}
 	}()
 
-	utils.LogMain("📦 [%s] START TRANSFER (S3 → %s)", slug, storageID)
+	utils.LogMain("📦 [%s] START TRANSFER (S3 temp → %s)", slug, storageID)
 
 	file, err := models.FileModel.FindByID(ctx, fileID)
 	if err != nil {
@@ -217,7 +236,7 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 	}
 	completeStep(ctx, job.ID, "extract")
 
-	// ─── STEP 3: INSTALL to local storage path ────────────────
+	// ─── STEP 3: INSTALL to local path or permanent S3 ────────
 	startStep(ctx, job.ID, "install")
 	installedRes := make([]string, 0, len(assets))
 
@@ -226,18 +245,42 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 			continue
 		}
 		src := filepath.Join(workDir, a.fileName)
-		if err := installFile(storagePath, fileID, a.fileName, src); err != nil {
+		if isS3Target {
+			objectKey := path.Join(fileID, a.fileName)
+			info, err := os.Stat(src)
+			if err != nil {
+				return fmt.Errorf("stat %s: %w", a.fileName, err)
+			}
+			if err := uploader.VerifyS3Object(ctx, targetStorage, objectKey, info.Size()); err != nil {
+				utils.LogMain("📤 [%s] Uploading %s to permanent S3...", slug, a.fileName)
+				if err := uploader.UploadToS3(ctx, targetStorage, src, objectKey, pctLogger64(slug, a.fileName)); err != nil {
+					return fmt.Errorf("upload %s: %w", a.fileName, err)
+				}
+				if err := uploader.VerifyS3Object(ctx, targetStorage, objectKey, info.Size()); err != nil {
+					return fmt.Errorf("verify %s: %w", a.fileName, err)
+				}
+			}
+			utils.LogMain("☁️  [%s] Installed %s → %s", slug, a.fileName, objectKey)
+		} else if err := installFile(storagePath, fileID, a.fileName, src); err != nil {
 			return fmt.Errorf("install %s: %w", a.fileName, err)
+		} else {
+			utils.LogMain("📂 [%s] Installed %s → %s/%s/", slug, a.fileName, storagePath, fileID)
 		}
 		installedRes = append(installedRes, a.resolution)
-		utils.LogMain("📂 [%s] Installed %s → %s/%s/", slug, a.fileName, storagePath, fileID)
 	}
 
 	if hasSpriteZip {
-		if err := installDir(storagePath, fileID, "sprite", spriteDir); err != nil {
-			return fmt.Errorf("install sprite: %w", err)
+		if isS3Target {
+			if err := uploadDirectoryToS3(ctx, targetStorage, spriteDir, path.Join(fileID, "sprite"), slug); err != nil {
+				return fmt.Errorf("upload sprite: %w", err)
+			}
+			utils.LogMain("☁️  [%s] Installed sprite/ → %s/sprite/", slug, fileID)
+		} else {
+			if err := installDir(storagePath, fileID, "sprite", spriteDir); err != nil {
+				return fmt.Errorf("install sprite: %w", err)
+			}
+			utils.LogMain("📂 [%s] Installed sprite/ → %s/%s/sprite/", slug, storagePath, fileID)
 		}
-		utils.LogMain("📂 [%s] Installed sprite/ → %s/%s/sprite/", slug, storagePath, fileID)
 	}
 	completeStep(ctx, job.ID, "install")
 
@@ -272,12 +315,16 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 		fn := fileName
 		resPtr := res
 		sid := storageID
+		mediaPath := filepath.Join(storagePath, fileID, fileName)
+		if isS3Target {
+			mediaPath = filepath.Join(workDir, fileName)
+		}
 		media := models.Media{
 			ID: newUUID(), Type: enums.MediaTypeVideo, FileName: &fn, MimeType: &mimeType,
 			Resolution: &resPtr, StorageID: &sid, Slug: utils.RandomString(11, false),
 			FileID: &fileID,
 			Metadata: &models.MediaMetadata{
-				Size:     fileSizeOf(filepath.Join(storagePath, fileID, fileName)),
+				Size:     fileSizeOf(mediaPath),
 				Duration: duration,
 			},
 			CreatedAt: now, UpdatedAt: now,
@@ -302,7 +349,7 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 		utils.LogMain("✅ [%s] Media moved: thumbnail", slug)
 	} else if hasSpriteZip && !hasThumbnailMedia(ctx, fileID) {
 		var totalSpriteSize int64
-		spriteDest := filepath.Join(storagePath, fileID, "sprite")
+		spriteDest := spriteDir
 		if entries, err := os.ReadDir(spriteDest); err == nil {
 			for _, e := range entries {
 				if !e.IsDir() {
@@ -403,4 +450,35 @@ func fileSizeOf(path string) int64 {
 		return 0
 	}
 	return info.Size()
+}
+
+func uploadDirectoryToS3(ctx context.Context, storage *models.Storage, root, objectPrefix, slug string) error {
+	return filepath.WalkDir(root, func(localPath string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		rel, err := filepath.Rel(root, localPath)
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		objectKey := path.Join(objectPrefix, filepath.ToSlash(rel))
+		if err := uploader.VerifyS3Object(ctx, storage, objectKey, info.Size()); err == nil {
+			return nil
+		}
+		utils.LogMain("📤 [%s] Uploading %s...", slug, objectKey)
+		if err := uploader.UploadToS3(ctx, storage, localPath, objectKey, nil); err != nil {
+			return err
+		}
+		return uploader.VerifyS3Object(ctx, storage, objectKey, info.Size())
+	})
 }

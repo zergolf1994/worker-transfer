@@ -25,18 +25,19 @@ type StepProgress struct {
 // VideoProcess represents a video processing job.
 // Collection: "video_process" | _id: String
 type VideoProcess struct {
-	ID              string   `bson:"_id" json:"id" goose:"required,default:uuid"`
-	SpaceID         *string  `bson:"spaceId,omitempty" json:"spaceId,omitempty" goose:"ref:workspaces,index"`
-	FileID          *string  `bson:"fileId,omitempty" json:"fileId,omitempty" goose:"ref:files,index"`
-	Slug            *string  `bson:"slug,omitempty" json:"slug,omitempty" goose:"index"`
-	WorkerID        *string  `bson:"workerId,omitempty" json:"workerId,omitempty" goose:"index"`
-	TargetStorageID *string  `bson:"targetStorageId,omitempty" json:"targetStorageId,omitempty"`
-	TransferMode    string   `bson:"transferMode,omitempty" json:"transferMode,omitempty"`
-	SourceStorageID *string  `bson:"sourceStorageId,omitempty" json:"sourceStorageId,omitempty"`
-	TempStorageID   *string  `bson:"tempStorageId,omitempty" json:"tempStorageId,omitempty"`
-	MigrationID     *string  `bson:"migrationId,omitempty" json:"migrationId,omitempty"`
-	SourceMediaIDs  []string `bson:"sourceMediaIds,omitempty" json:"sourceMediaIds,omitempty"`
-	Status          *string  `bson:"status,omitempty" json:"status,omitempty" goose:"index"`
+	ID                   string   `bson:"_id" json:"id" goose:"required,default:uuid"`
+	SpaceID              *string  `bson:"spaceId,omitempty" json:"spaceId,omitempty" goose:"ref:workspaces,index"`
+	FileID               *string  `bson:"fileId,omitempty" json:"fileId,omitempty" goose:"ref:files,index"`
+	Slug                 *string  `bson:"slug,omitempty" json:"slug,omitempty" goose:"index"`
+	WorkerID             *string  `bson:"workerId,omitempty" json:"workerId,omitempty" goose:"index"`
+	TargetStorageID      *string  `bson:"targetStorageId,omitempty" json:"targetStorageId,omitempty"`
+	DestinationStorageID *string  `bson:"destinationStorageId,omitempty" json:"destinationStorageId,omitempty"`
+	TransferMode         string   `bson:"transferMode,omitempty" json:"transferMode,omitempty"`
+	SourceStorageID      *string  `bson:"sourceStorageId,omitempty" json:"sourceStorageId,omitempty"`
+	TempStorageID        *string  `bson:"tempStorageId,omitempty" json:"tempStorageId,omitempty"`
+	MigrationID          *string  `bson:"migrationId,omitempty" json:"migrationId,omitempty"`
+	SourceMediaIDs       []string `bson:"sourceMediaIds,omitempty" json:"sourceMediaIds,omitempty"`
+	Status               *string  `bson:"status,omitempty" json:"status,omitempty" goose:"index"`
 	// Queue fields — enqueuer (vdohide-service) sets priority; worker stamps claimedAt
 	// when claiming pending → processing. Reaper uses claimedAt to detect stuck jobs.
 	Priority       *int        `bson:"priority,omitempty" json:"priority,omitempty"`
