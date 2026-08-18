@@ -135,10 +135,12 @@ func runEvacuate(ctx context.Context, job *models.VideoProcess) error {
 				"deletedAt": bson.M{"$exists": true, "$ne": nil},
 			})
 			if cutOverCount == int64(len(job.SourceMediaIDs)) {
-				if err := invalidateMigrationCache(ctx, fileID, slug, migrationID); err != nil {
-					return err
+				if cacheInvalidationEnabled {
+					if err := invalidateMigrationCache(ctx, fileID, slug, migrationID); err != nil {
+						return err
+					}
 				}
-				utils.LogMain("✅ [%s] Direct migration already cut over; cache invalidated", slug)
+				utils.LogMain("✅ [%s] Direct migration already cut over", slug)
 				success = true
 				return nil
 			}
@@ -225,7 +227,7 @@ func runEvacuate(ctx context.Context, job *models.VideoProcess) error {
 	}
 	completeStep(ctx, job.ID, "upload")
 	startStep(ctx, job.ID, "ingest")
-	if directToPermanentS3 {
+	if directToPermanentS3 && cacheInvalidationEnabled {
 		if err := invalidateMigrationCache(ctx, fileID, slug, migrationID); err != nil {
 			return err
 		}

@@ -432,6 +432,11 @@ func resolveS3TempStorage(ctx context.Context) (*models.Storage, error) {
 
 // ─── Cache invalidation (Redis + Cloudflare) ─────────────────
 
+// Cache invalidation is intentionally disabled while content-node controls
+// playlist freshness through CDN TTLs. Set this to true to restore every
+// guarded Redis/Cloudflare invalidation call.
+const cacheInvalidationEnabled = false
+
 // collectSlugs คืน slug ของไฟล์ + cloned files ทั้งหมด (ใช้ทั้ง Redis DEL
 // และ CF purge — query ครั้งเดียว)
 func collectSlugs(ctx context.Context, fileID, slug string) []string {

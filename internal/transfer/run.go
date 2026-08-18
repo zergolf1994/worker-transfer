@@ -208,14 +208,16 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 
 	if len(assets) == 0 {
 		// A migration retry may arrive after its DB cutover committed but before
-		// the Temp cleanup handoff or cache invalidation completed. Both
-		// operations are idempotent, so finish them before settling the job.
+		// the Temp cleanup handoff completed. Cache invalidation stays guarded so
+		// it can be restored later without rebuilding this recovery path.
 		if isMigration {
 			if err := finalizeMigrationIngests(ctx, fileID, migrationID, sourceStorageID); err != nil {
 				return fmt.Errorf("finalize migrated ingest: %w", err)
 			}
-			if err := invalidateMigrationCache(ctx, fileID, slug, migrationID); err != nil {
-				return err
+			if cacheInvalidationEnabled {
+				if err := invalidateMigrationCache(ctx, fileID, slug, migrationID); err != nil {
+					return err
+				}
 			}
 		}
 		// enqueuer queued a file with nothing pending — treat as done, not failed
@@ -389,21 +391,19 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 	}
 	completeStep(ctx, job.ID, "media")
 
-	// ─── Cache invalidation (ครั้งเดียวต่อ job — ไฟล์ + clones) ──
-	// Redis: ลบ playlist_master/playlist_json/embed_resolve ทุกครั้งที่มี
-	//   media ใหม่ (รวม sprite — embed/feed เปลี่ยน) | ไม่ตั้ง REDIS_URL = no-op
-	// Cloudflare: purge playlist.m3u8 after media creation/cutover so cached
-	// playlists immediately pick up the new media slugs. Migration requires
-	// a configured playlist profile; regular ingest remains best-effort.
-	if isMigration {
-		if err := invalidateMigrationCache(ctx, fileID, slug, migrationID); err != nil {
-			return err
-		}
-	} else if len(installedRes) > 0 || hasSpriteZip {
-		slugs := collectSlugs(ctx, fileID, slug)
-		cache.Del(ctx, redisKeysFor(slugs)...)
-		if needCfPurge {
-			_ = purgePlaylistCache(ctx, slug, slugs, false)
+	// Cache invalidation is disabled; content-node/CDN TTL controls freshness.
+	// Flip cacheInvalidationEnabled to restore both Redis and Cloudflare calls.
+	if cacheInvalidationEnabled {
+		if isMigration {
+			if err := invalidateMigrationCache(ctx, fileID, slug, migrationID); err != nil {
+				return err
+			}
+		} else if len(installedRes) > 0 || hasSpriteZip {
+			slugs := collectSlugs(ctx, fileID, slug)
+			cache.Del(ctx, redisKeysFor(slugs)...)
+			if needCfPurge {
+				_ = purgePlaylistCache(ctx, slug, slugs, false)
+			}
 		}
 	}
 

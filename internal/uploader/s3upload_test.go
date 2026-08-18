@@ -16,14 +16,15 @@ import (
 )
 
 type fakeMultipartClient struct {
-	mu          sync.Mutex
-	active      int
-	maxActive   int
-	parts       map[int32][]byte
-	completed   []int32
-	aborted     bool
-	completeHit bool
-	failPart    int32
+	mu           sync.Mutex
+	active       int
+	maxActive    int
+	parts        map[int32][]byte
+	completed    []int32
+	aborted      bool
+	completeHit  bool
+	failPart     int32
+	failComplete bool
 }
 
 func (f *fakeMultipartClient) CreateMultipartUpload(
@@ -81,6 +82,9 @@ func (f *fakeMultipartClient) CompleteMultipartUpload(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.completeHit = true
+	if f.failComplete {
+		return nil, errors.New("forced complete failure")
+	}
 	for _, part := range input.MultipartUpload.Parts {
 		f.completed = append(f.completed, aws.ToInt32(part.PartNumber))
 	}
@@ -114,7 +118,7 @@ func TestUploadMultipartRunsPartsConcurrentlyAndCompletesInOrder(t *testing.T) {
 	var uploaded int64
 
 	err := uploadMultipart(context.Background(), client, "bucket", "key", path,
-		int64(len(data)), 10, 3, func(done, _ int64) { uploaded = done })
+		int64(len(data)), "application/octet-stream", 10, 3, func(done, _ int64) { uploaded = done })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +145,7 @@ func TestUploadMultipartAbortsWhenPartFails(t *testing.T) {
 	client := &fakeMultipartClient{failPart: 2}
 
 	err := uploadMultipart(context.Background(), client, "bucket", "key", path,
-		int64(len(data)), 10, 3, nil)
+		int64(len(data)), "application/octet-stream", 10, 3, nil)
 	if err == nil {
 		t.Fatal("expected upload error")
 	}
@@ -150,5 +154,20 @@ func TestUploadMultipartAbortsWhenPartFails(t *testing.T) {
 	}
 	if client.completeHit {
 		t.Fatal("multipart upload must not complete after a failed part")
+	}
+}
+
+func TestUploadMultipartAbortsWhenCompleteFails(t *testing.T) {
+	data := []byte("abcdefghijklmnopqrstuvwxyz")
+	path := writeUploadFixture(t, data)
+	client := &fakeMultipartClient{failComplete: true}
+
+	err := uploadMultipart(context.Background(), client, "bucket", "key", path,
+		int64(len(data)), "application/octet-stream", 10, 3, nil)
+	if err == nil {
+		t.Fatal("expected complete error")
+	}
+	if !client.aborted {
+		t.Fatal("expected multipart upload to be aborted")
 	}
 }
