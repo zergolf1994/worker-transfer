@@ -43,6 +43,7 @@ func LocalStorageBlockReason(ctx context.Context) string {
 type consumedAsset struct {
 	ingest     *models.Ingest
 	resolution string // "" for sprite.zip
+	mediaType  string
 	fileName   string
 	downloaded bool
 }
@@ -77,6 +78,17 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 
 	storagePath := config.AppConfig.StoragePath
 	storageID := derefStr(job.DestinationStorageID)
+	forceLocalInstall := false
+	if !isMigration {
+		forceLocal, _ := models.IngestModel.CountDocuments(ctx, bson.M{
+			"fileId": fileID, "sourceType": enums.IngestSourceTypeProcessed,
+			"installTarget": "local", "deletedAt": bson.M{"$exists": false},
+		})
+		if forceLocal > 0 {
+			forceLocalInstall = true
+			storageID = config.AppConfig.StorageId
+		}
+	}
 	if storageID == "" {
 		storageID = config.AppConfig.StorageId
 	}
@@ -85,6 +97,9 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 		return fmt.Errorf("target storage %s not found: %w", storageID, err)
 	}
 	isS3Target := targetStorage.Type == enums.StorageTypeS3
+	if forceLocalInstall && isS3Target {
+		return fmt.Errorf("local fallback was assigned to non-local worker: %w", queue.ErrJobRequeue)
+	}
 
 	if isS3Target {
 		if !targetStorage.IsOnline() || targetStorage.S3 == nil {
@@ -161,7 +176,7 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 		if !isMigration && hasVideoMedia(ctx, fileID, res) {
 			// media already exists (installed elsewhere) — stale ingest, clean up later
 			utils.LogMain("⏭️  [%s] %s media already exists — stale ingest", slug, res)
-			assets = append(assets, consumedAsset{ingest: ingest, resolution: res, fileName: fileName})
+			assets = append(assets, consumedAsset{ingest: ingest, resolution: res, mediaType: enums.MediaTypeVideo, fileName: fileName})
 			continue
 		}
 
@@ -175,7 +190,36 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 		if err := downloader.DownloadFromS3(ctx, s3Storage, key, dest, pctLogger64(slug, fileName)); err != nil {
 			return fmt.Errorf("download %s: %w", fileName, err)
 		}
-		assets = append(assets, consumedAsset{ingest: ingest, resolution: res, fileName: fileName, downloaded: true})
+		assets = append(assets, consumedAsset{ingest: ingest, resolution: res, mediaType: enums.MediaTypeVideo, fileName: fileName, downloaded: true})
+	}
+
+	if !isMigration {
+		trackIngests, err := pendingTrackIngests(ctx, fileID)
+		if err != nil {
+			return fmt.Errorf("list track ingests: %w", err)
+		}
+		for _, ingest := range trackIngests {
+			mediaType := derefStr(ingest.MediaType)
+			fileName := filepath.Base(ingest.FileName)
+			if fileName != ingest.FileName || fileName == "." || fileName == "" {
+				return fmt.Errorf("invalid track fileName %q", ingest.FileName)
+			}
+			if hasTrackMedia(ctx, fileID, mediaType, fileName) {
+				assets = append(assets, consumedAsset{ingest: ingest, mediaType: mediaType, fileName: fileName})
+				continue
+			}
+			s3Storage, err := getStorage(derefStr(ingest.StorageID))
+			if err != nil {
+				return fmt.Errorf("download %s: %w", fileName, err)
+			}
+			key := ingestObjectKey(ingest, fileID)
+			dest := filepath.Join(workDir, fileName)
+			utils.LogMain("📥 [%s] Downloading %s (key=%s)...", slug, fileName, key)
+			if err := downloader.DownloadFromS3(ctx, s3Storage, key, dest, pctLogger64(slug, fileName)); err != nil {
+				return fmt.Errorf("download %s: %w", fileName, err)
+			}
+			assets = append(assets, consumedAsset{ingest: ingest, mediaType: mediaType, fileName: fileName, downloaded: true})
+		}
 	}
 
 	// sprite.zip (thumbnail track)
@@ -243,7 +287,7 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 	installedRes := make([]string, 0, len(assets))
 
 	for _, a := range assets {
-		if !a.downloaded || a.resolution == "" {
+		if !a.downloaded || a.mediaType == "" {
 			continue
 		}
 		src := filepath.Join(workDir, a.fileName)
@@ -268,7 +312,9 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 		} else {
 			utils.LogMain("📂 [%s] Installed %s → %s/%s/", slug, a.fileName, storagePath, fileID)
 		}
-		installedRes = append(installedRes, a.resolution)
+		if a.resolution != "" {
+			installedRes = append(installedRes, a.resolution)
+		}
 	}
 
 	if hasSpriteZip {
@@ -293,6 +339,9 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 	needCfPurge := false
 
 	for _, res := range installedRes {
+		if res == "" {
+			continue
+		}
 		if isMigration {
 			var ingest *models.Ingest
 			for _, asset := range assets {
@@ -321,14 +370,18 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 		if isS3Target {
 			mediaPath = filepath.Join(workDir, fileName)
 		}
+		metadata := &models.MediaMetadata{Size: fileSizeOf(mediaPath), Duration: duration}
+		for _, asset := range assets {
+			if asset.resolution == res && asset.ingest != nil && asset.ingest.MediaMetadata != nil {
+				metadata = asset.ingest.MediaMetadata
+				break
+			}
+		}
 		media := models.Media{
 			ID: newUUID(), Type: enums.MediaTypeVideo, FileName: &fn, MimeType: &mimeType,
 			Resolution: &resPtr, StorageID: &sid, Slug: utils.RandomString(11, false),
-			FileID: &fileID,
-			Metadata: &models.MediaMetadata{
-				Size:     fileSizeOf(mediaPath),
-				Duration: duration,
-			},
+			FileID:    &fileID,
+			Metadata:  metadata,
 			CreatedAt: now, UpdatedAt: now,
 		}
 		if _, err := models.MediaModel.Create(ctx, &media); err != nil {
@@ -339,6 +392,46 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 		if isPurgeResolution(res) {
 			needCfPurge = true
 		}
+	}
+
+	for _, asset := range assets {
+		if !asset.downloaded || (asset.mediaType != enums.MediaTypeAudio && asset.mediaType != enums.MediaTypeSubtitle) {
+			continue
+		}
+		if hasTrackMedia(ctx, fileID, asset.mediaType, asset.fileName) {
+			continue
+		}
+		mimeType := "application/octet-stream"
+		if asset.ingest.MimeType != nil {
+			mimeType = *asset.ingest.MimeType
+		}
+		fn, sid := asset.fileName, storageID
+		metadata := asset.ingest.MediaMetadata
+		if metadata == nil {
+			metadata = &models.MediaMetadata{Size: asset.ingest.Size, Duration: duration}
+		}
+		media := models.Media{ID: newUUID(), Type: asset.mediaType, FileName: &fn, MimeType: &mimeType,
+			StorageID: &sid, Slug: utils.RandomString(11, false), FileID: &fileID,
+			Metadata: metadata, CreatedAt: now, UpdatedAt: now}
+		if isS3Target {
+			objectPath := path.Join(fileID, asset.fileName)
+			media.Path = &objectPath
+		}
+		if _, err := models.MediaModel.Create(ctx, &media); err != nil {
+			return fmt.Errorf("create %s media %s: %w", asset.mediaType, asset.fileName, err)
+		}
+		cloneMediaToClonedFiles(ctx, fileID, media, slug)
+		utils.LogMain("✅ [%s] Media record: %s %s", slug, asset.mediaType, asset.fileName)
+	}
+
+	audioCount, _ := models.MediaModel.CountDocuments(ctx, bson.M{"fileId": fileID, "type": enums.MediaTypeAudio, "deletedAt": bson.M{"$exists": false}})
+	subtitleCount, _ := models.MediaModel.CountDocuments(ctx, bson.M{"fileId": fileID, "type": enums.MediaTypeSubtitle, "deletedAt": bson.M{"$exists": false}})
+	if audioCount > 0 || subtitleCount > 0 {
+		layout := "separated"
+		audio, subtitles := int(audioCount), int(subtitleCount)
+		update := bson.M{"$set": bson.M{"metadata.mediaLayout": layout, "metadata.audioTrackCount": audio, "metadata.subtitleTrackCount": subtitles}}
+		_, _ = models.FileModel.UpdateByID(ctx, fileID, update)
+		_, _ = models.FileModel.UpdateMany(ctx, bson.M{"clonedFrom": fileID, "metadata.deletedAt": bson.M{"$exists": false}}, update)
 	}
 
 	if hasSpriteZip && isMigration {

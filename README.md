@@ -1,6 +1,6 @@
 # Worker Transfer
 
-Queue-based transfer worker สำหรับ [VdoHide](https://vdohide.xyz) — ดึงไฟล์ผลลัพธ์ (original + transcoded + sprite) จาก S3 temp ลง **local storage ของเครื่องตัวเอง** สร้าง media records แล้วเคลียร์ ingest ที่ใช้แล้ว
+Queue-based transfer worker สำหรับ [VdoHide](https://vdohide.xyz) — ดึงไฟล์ผลลัพธ์ (video + audio + subtitle + sprite) จาก S3 temp ลง **local storage ของเครื่องตัวเอง** สร้าง media records พร้อม track metadata แล้วเคลียร์ ingest ที่ใช้แล้ว
 
 > แทนที่ `server-transfer` เดิมที่ scan หาไฟล์เอง — ตัวนี้รับงานจากคิวอย่างเดียว และรับเฉพาะงานที่ enqueuer assign มาให้ storage ของตัวเอง (`targetStorageId`)
 

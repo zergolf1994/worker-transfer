@@ -127,6 +127,27 @@ func pendingIngestFor(ctx context.Context, fileID, fileName string) *models.Inge
 	return ingest
 }
 
+func pendingTrackIngests(ctx context.Context, fileID string) ([]*models.Ingest, error) {
+	cursor, err := models.IngestModel.FindRaw(ctx, bson.M{
+		"fileId": fileID, "sourceType": enums.IngestSourceTypeProcessed,
+		"status": enums.IngestStatusCompleted, "deletedAt": bson.M{"$exists": false},
+		"mediaType": bson.M{"$in": []string{enums.MediaTypeAudio, enums.MediaTypeSubtitle}},
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+	result := make([]*models.Ingest, 0)
+	for cursor.Next(ctx) {
+		var ingest models.Ingest
+		if err := cursor.Decode(&ingest); err != nil {
+			return nil, err
+		}
+		result = append(result, &ingest)
+	}
+	return result, cursor.Err()
+}
+
 func pendingMigrationIngestFor(ctx context.Context, fileID, fileName, migrationID string) *models.Ingest {
 	ingest, err := models.IngestModel.FindOne(ctx, bson.M{
 		"fileId":         fileID,
@@ -160,6 +181,14 @@ func hasVideoMedia(ctx context.Context, fileID, resolution string) bool {
 		"type":       enums.MediaTypeVideo,
 		"resolution": resolution,
 		"deletedAt":  bson.M{"$exists": false},
+	})
+	return count > 0
+}
+
+func hasTrackMedia(ctx context.Context, fileID, mediaType, fileName string) bool {
+	count, _ := models.MediaModel.CountDocuments(ctx, bson.M{
+		"fileId": fileID, "type": mediaType, "fileName": fileName,
+		"deletedAt": bson.M{"$exists": false},
 	})
 	return count > 0
 }
@@ -367,6 +396,9 @@ func cloneMediaToClonedFiles(ctx context.Context, sourceFileID string, media mod
 		filter := bson.M{"fileId": clonedFile.ID, "type": media.Type}
 		if media.Resolution != nil {
 			filter["resolution"] = *media.Resolution
+		}
+		if media.FileName != nil {
+			filter["fileName"] = *media.FileName
 		}
 		existCount, _ := models.MediaModel.CountDocuments(ctx, filter)
 		if existCount > 0 {
