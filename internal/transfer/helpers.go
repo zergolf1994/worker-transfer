@@ -148,6 +148,28 @@ func pendingTrackIngests(ctx context.Context, fileID string) ([]*models.Ingest, 
 	return result, cursor.Err()
 }
 
+func pendingMigrationTrackIngests(ctx context.Context, fileID, migrationID string) ([]*models.Ingest, error) {
+	cursor, err := models.IngestModel.FindRaw(ctx, bson.M{
+		"fileId": fileID, "sourceType": enums.IngestSourceTypeMigration,
+		"migrationId": migrationID, "migrationState": enums.IngestMigrationStateStaged,
+		"deletedAt": bson.M{"$exists": false},
+		"mediaType": bson.M{"$in": []string{enums.MediaTypeAudio, enums.MediaTypeSubtitle}},
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+	result := make([]*models.Ingest, 0)
+	for cursor.Next(ctx) {
+		var ingest models.Ingest
+		if err := cursor.Decode(&ingest); err != nil {
+			return nil, err
+		}
+		result = append(result, &ingest)
+	}
+	return result, cursor.Err()
+}
+
 func pendingMigrationIngestFor(ctx context.Context, fileID, fileName, migrationID string) *models.Ingest {
 	ingest, err := models.IngestModel.FindOne(ctx, bson.M{
 		"fileId":         fileID,

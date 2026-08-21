@@ -94,15 +94,22 @@ func runEvacuate(ctx context.Context, job *models.VideoProcess) error {
 			return fmt.Errorf("decode source media: %w", err)
 		}
 		switch media.Type {
-		case enums.MediaTypeVideo:
+		case enums.MediaTypeVideo, enums.MediaTypeAudio, enums.MediaTypeSubtitle:
 			fileName := derefStr(media.FileName)
 			if fileName == "" || filepath.Base(fileName) != fileName {
 				return fmt.Errorf("media %s has invalid fileName", media.ID)
 			}
 			relPath := filepath.Join(fileID, fileName)
+			if media.Path != nil && *media.Path != "" {
+				relPath = filepath.FromSlash(*media.Path)
+			}
+			mimeType := derefStr(media.MimeType)
+			if mimeType == "" {
+				mimeType = "application/octet-stream"
+			}
 			assets = append(assets, evacuationAsset{
 				media: media, localPath: filepath.Join(config.AppConfig.StoragePath, relPath),
-				fileName: fileName, sourcePath: relPath, mimeType: "video/mp4",
+				fileName: fileName, sourcePath: relPath, mimeType: mimeType,
 			})
 		case enums.MediaTypeThumbnail:
 			sourceDir := filepath.Join(config.AppConfig.StoragePath, fileID, "sprite")
@@ -170,7 +177,7 @@ func runEvacuate(ctx context.Context, job *models.VideoProcess) error {
 		}
 
 		if directToPermanentS3 {
-			if asset.media.Type == enums.MediaTypeVideo {
+			if asset.media.Type != enums.MediaTypeThumbnail {
 				objectKey := filepath.ToSlash(filepath.Join(fileID, asset.fileName))
 				if err := uploader.VerifyS3Object(ctx, uploadStorage, objectKey, info.Size()); err != nil {
 					utils.LogMain("📤 [%s] Uploading %s...", slug, asset.fileName)
@@ -216,6 +223,8 @@ func runEvacuate(ctx context.Context, job *models.VideoProcess) error {
 					"migrationState": enums.IngestMigrationStateStaged,
 					"sourceMediaId":  asset.media.ID, "sourceStorageId": sourceStorageID,
 					"sourcePath": asset.sourcePath, "updatedAt": now,
+					"mediaType": asset.media.Type, "resolution": asset.media.Resolution,
+					"mediaMetadata": asset.media.Metadata,
 				},
 				"$setOnInsert": bson.M{"_id": newUUID(), "createdAt": now},
 			},

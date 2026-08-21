@@ -54,6 +54,8 @@ func Run(jobCtx context.Context, job *models.VideoProcess) error {
 	switch job.TransferMode {
 	case enums.TransferModeEvacuate:
 		err = runEvacuate(jobCtx, job)
+	case enums.TransferModeRestore:
+		err = runRestore(jobCtx, job)
 	case enums.TransferModeCleanup:
 		err = runCleanup(jobCtx, job)
 	default:
@@ -195,8 +197,14 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 		assets = append(assets, consumedAsset{ingest: ingest, resolution: res, mediaType: enums.MediaTypeVideo, fileName: fileName, downloaded: true})
 	}
 
-	if !isMigration {
-		trackIngests, err := pendingTrackIngests(ctx, fileID)
+	{
+		var trackIngests []*models.Ingest
+		var err error
+		if isMigration {
+			trackIngests, err = pendingMigrationTrackIngests(ctx, fileID, migrationID)
+		} else {
+			trackIngests, err = pendingTrackIngests(ctx, fileID)
+		}
 		if err != nil {
 			return fmt.Errorf("list track ingests: %w", err)
 		}
@@ -206,7 +214,7 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 			if fileName != ingest.FileName || fileName == "." || fileName == "" {
 				return fmt.Errorf("invalid track fileName %q", ingest.FileName)
 			}
-			if hasTrackMedia(ctx, fileID, mediaType, fileName) {
+			if !isMigration && hasTrackMedia(ctx, fileID, mediaType, fileName) {
 				assets = append(assets, consumedAsset{ingest: ingest, mediaType: mediaType, fileName: fileName})
 				continue
 			}
@@ -401,6 +409,15 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 			continue
 		}
 		if hasTrackMedia(ctx, fileID, asset.mediaType, asset.fileName) {
+			if !isMigration {
+				continue
+			}
+		}
+		if isMigration {
+			if err := cutoverMigrationMedia(ctx, asset.ingest, storageID, fileID, "", asset.mediaType); err != nil {
+				return fmt.Errorf("migrate %s media %s: %w", asset.mediaType, asset.fileName, err)
+			}
+			utils.LogMain("✅ [%s] Media moved: %s %s", slug, asset.mediaType, asset.fileName)
 			continue
 		}
 		mimeType := "application/octet-stream"

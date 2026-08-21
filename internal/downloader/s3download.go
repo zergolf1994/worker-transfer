@@ -136,3 +136,61 @@ func DownloadFromS3(ctx context.Context, storage *models.Storage, objectPath, ou
 	}
 	return fmt.Errorf("S3 download failed after 3 attempts: %v", lastErr)
 }
+
+// DownloadPrefixFromS3 downloads every object under prefix into outputDir.
+// It is used for permanent sprite directories, which are stored as separate
+// VTT/JPEG objects rather than a Temp sprite.zip archive.
+func DownloadPrefixFromS3(ctx context.Context, storage *models.Storage, prefix, outputDir string) (int, error) {
+	if storage.S3 == nil {
+		return 0, fmt.Errorf("storage has no S3 config")
+	}
+	s3Cfg := storage.S3
+	endpoint := strings.TrimRight(*s3Cfg.Endpoint, "/")
+	if !strings.HasPrefix(endpoint, "http") {
+		endpoint = "https://" + endpoint
+	}
+	if strings.HasSuffix(endpoint, "/"+s3Cfg.Bucket) {
+		endpoint = endpoint[:len(endpoint)-len(s3Cfg.Bucket)-1]
+	}
+	objectPrefix := strings.Trim(prefix, "/") + "/"
+	if s3Cfg.Prefix != "" && !strings.HasPrefix(objectPrefix, strings.Trim(s3Cfg.Prefix, "/")+"/") {
+		objectPrefix = strings.Trim(s3Cfg.Prefix, "/") + "/" + objectPrefix
+	}
+	region := s3Cfg.Region
+	if region == "" {
+		region = "auto"
+	}
+	client := s3.New(s3.Options{
+		Region: region, BaseEndpoint: &endpoint,
+		Credentials:  credentials.NewStaticCredentialsProvider(s3Cfg.AccessKeyID, s3Cfg.SecretAccessKey, ""),
+		UsePathStyle: s3Cfg.ForcePathStyle,
+	})
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(s3Cfg.Bucket), MaxKeys: aws.Int32(1000), Prefix: aws.String(objectPrefix),
+	})
+	count := 0
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return count, fmt.Errorf("S3 ListObjectsV2: %w", err)
+		}
+		for _, object := range page.Contents {
+			if object.Key == nil || strings.HasSuffix(*object.Key, "/") {
+				continue
+			}
+			rel := strings.TrimPrefix(*object.Key, objectPrefix)
+			cleanRel := filepath.Clean(filepath.FromSlash(rel))
+			if rel == "" || cleanRel == "." || filepath.IsAbs(cleanRel) || cleanRel == ".." || strings.HasPrefix(cleanRel, ".."+string(filepath.Separator)) {
+				return count, fmt.Errorf("unsafe S3 object path %q", rel)
+			}
+			if err := DownloadFromS3(ctx, storage, *object.Key, filepath.Join(outputDir, cleanRel), nil); err != nil {
+				return count, err
+			}
+			count++
+		}
+	}
+	if count == 0 {
+		return 0, fmt.Errorf("no objects found under %s", prefix)
+	}
+	return count, nil
+}

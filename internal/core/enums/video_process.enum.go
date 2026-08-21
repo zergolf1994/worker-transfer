@@ -15,6 +15,7 @@ const (
 const (
 	TransferModeInstall  = "install"
 	TransferModeEvacuate = "evacuate"
+	TransferModeRestore  = "restore"
 	TransferModeCleanup  = "cleanup"
 )
 

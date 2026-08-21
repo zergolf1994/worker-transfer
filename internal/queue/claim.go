@@ -38,7 +38,7 @@ func Claim(ctx context.Context, workerID string) (*models.VideoProcess, error) {
 	assignments := []bson.M{}
 	if storage.Enable && storage.Status == enums.StorageStatusOnline {
 		assignments = append(assignments, bson.M{
-			"transferMode":    bson.M{"$in": []interface{}{enums.TransferModeInstall, nil}},
+			"transferMode":    bson.M{"$in": []interface{}{enums.TransferModeInstall, enums.TransferModeRestore, nil}},
 			"targetStorageId": config.AppConfig.StorageId,
 		})
 	}
