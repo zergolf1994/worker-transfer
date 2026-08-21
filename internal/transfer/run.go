@@ -79,7 +79,9 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 	storagePath := config.AppConfig.StoragePath
 	storageID := derefStr(job.DestinationStorageID)
 	forceLocalInstall := false
-	if !isMigration {
+	// destinationStorageId ที่ enqueuer ระบุมามีสิทธิ์เหนือ marker local แบบเก่า
+	// เพื่อให้ ingest ที่ fallback ลง Temp สามารถกู้ไป permanent S3 ได้
+	if !isMigration && storageID == "" {
 		forceLocal, _ := models.IngestModel.CountDocuments(ctx, bson.M{
 			"fileId": fileID, "sourceType": enums.IngestSourceTypeProcessed,
 			"installTarget": "local", "deletedAt": bson.M{"$exists": false},
