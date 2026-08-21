@@ -284,10 +284,16 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 	// ─── STEP 2: EXTRACT sprite.zip ───────────────────────────
 	startStep(ctx, job.ID, "extract")
 	spriteDir := filepath.Join(workDir, "sprite")
+	var totalSpriteSize int64
 	if hasSpriteZip {
 		utils.LogMain("📦 [%s] Extracting sprite.zip...", slug)
 		if err := unzip(ctx, spriteZipPath, spriteDir); err != nil {
 			return fmt.Errorf("extract sprite.zip: %w", err)
+		}
+		var err error
+		totalSpriteSize, err = directoryFilesSize(spriteDir)
+		if err != nil {
+			return fmt.Errorf("calculate sprite size: %w", err)
 		}
 	}
 	completeStep(ctx, job.ID, "extract")
@@ -462,17 +468,6 @@ func run(ctx context.Context, job *models.VideoProcess) error {
 		}
 		utils.LogMain("✅ [%s] Media moved: thumbnail", slug)
 	} else if hasSpriteZip && !hasThumbnailMedia(ctx, fileID) {
-		var totalSpriteSize int64
-		spriteDest := spriteDir
-		if entries, err := os.ReadDir(spriteDest); err == nil {
-			for _, e := range entries {
-				if !e.IsDir() {
-					if info, err := e.Info(); err == nil {
-						totalSpriteSize += info.Size()
-					}
-				}
-			}
-		}
 		thumbFn := enums.SpriteVTTName
 		sid := storageID
 		thumbMedia := models.Media{

@@ -37,6 +37,30 @@ func installDir(storagePath, fileID, subDir, srcDir string) error {
 	return nil
 }
 
+// directoryFilesSize returns the combined size of regular files directly in dir.
+// Capture this before installDir, because installDir moves the source files.
+func directoryFilesSize(dir string) (int64, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, err
+	}
+
+	var total int64
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return 0, err
+		}
+		if info.Mode().IsRegular() {
+			total += info.Size()
+		}
+	}
+	return total, nil
+}
+
 // moveFile renames when possible (same volume), falls back to copy+delete.
 func moveFile(src, dest string) error {
 	if err := os.Rename(src, dest); err == nil {
